@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import type { CameraStatus } from '../hooks/useSocket';
+import type { CameraStatus } from '../stores/useCameraStore';
+import { getServerOrigin } from '../utils/serverOrigin';
 import './CameraFeed.css';
 
 interface CameraFeedProps {
@@ -8,9 +9,7 @@ interface CameraFeedProps {
   onToggleStream: () => void;
 }
 
-const STREAM_URL = import.meta.env.VITE_SOCKET_URL
-  ? `${import.meta.env.VITE_SOCKET_URL}/camera/stream`
-  : 'http://localhost:8080/camera/stream';
+const STREAM_URL = `${getServerOrigin()}/camera/stream`;
 
 export function CameraFeed({ cameraStatus, onToggleCamera, onToggleStream }: CameraFeedProps) {
   const [streamError, setStreamError] = useState(false);

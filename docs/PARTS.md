@@ -8,10 +8,10 @@ Hardware components for building the OpenFlight golf launch monitor.
 
 | Part | Description | Link | ~Price |
 |------|-------------|------|--------|
-| **OPS243-A Radar** | Doppler radar for ball/club speed detection | [OmniPreSense](https://omnipresense.com/product/ops243-a-doppler-radar-sensor/) | $249 |
+| **OPS243 Radar** | Doppler radar for ball/club speed detection | [OmniPreSense](https://omnipresense.com/product/ops243-doppler-radar-sensor/) | $249 |
 | **Raspberry Pi 5** | Main compute unit (4GB+ recommended) | [Adafruit](https://www.adafruit.com/product/5812) | $60 |
 
-> **WARNING: Do NOT buy the OPS243-A-W (WiFi version).** The WiFi module locks the serial baud rate to 19200, which is far too slow for I/Q data transfer. OpenFlight requires the standard **OPS243-A** (USB only) which runs at 57600 baud over CDC-ACM. The WiFi version is not compatible.
+> **WARNING: Do NOT buy the OPS243-A-W (WiFi version).** The WiFi module locks the serial baud rate to 19200, which is far too slow for I/Q data transfer. OpenFlight requires the standard **OPS243** (USB only) which runs at 57600 baud over CDC-ACM. The WiFi version is not compatible.
 | **7" Touchscreen Display** | HMTECH 7" 1024x600 IPS display | [Amazon](https://www.amazon.com/dp/B0D3QB7X4Z) | $46 |
 
 ## Sound Trigger (for Rolling Buffer Mode)
@@ -29,7 +29,7 @@ The sound trigger detects club impact to precisely time radar captures. Essentia
 ### Sound Trigger Wiring
 
 ```
-SEN-14262               Raspberry Pi           OPS243-A
+SEN-14262               Raspberry Pi           OPS243
 ┌───────────┐          ┌──────────┐          ┌──────────┐
 │ VCC ──────┼──────────┤ 3.3V     │          │          │
 │           │          │          │          │          │
@@ -44,7 +44,7 @@ See [sound-trigger-wiring.md](sound-trigger-wiring.md) for detailed instructions
 
 ## Angle Radar (K-LD7)
 
-Two K-LD7 modules measure launch angle (vertical) and club path / aim direction (horizontal). The OPS243-A handles speed; the K-LD7s provide **angle and distance only** (speed data aliases above 62 mph).
+Two K-LD7 modules measure launch angle (vertical) and club path / aim direction (horizontal). The OPS243 handles speed; the K-LD7s provide **angle and distance only** (speed data aliases above 62 mph).
 
 | Part | Description | Link | ~Price |
 |------|-------------|------|--------|
@@ -69,7 +69,7 @@ One unit is mounted vertically (launch angle), one horizontally (club path / aim
 |------|-------------|------|--------|
 | **27W USB-C Power Supply** | Official Pi 5 power supply (5V 5A) | [Adafruit](https://www.adafruit.com/product/5974) | $12 |
 | MicroSD Card (32GB+) | For Pi OS and software | Any Class 10 | $10 |
-| USB-A to Micro-USB Cable | For OPS243-A radar connection | Any | $5 |
+| USB-A to Micro-USB Cable | For OPS243 radar connection | Any | $5 |
 
 ## Optional
 
@@ -83,7 +83,7 @@ One unit is mounted vertically (launch angle), one horizontally (club path / aim
 
 | Category | ~Price |
 |----------|--------|
-| Core (OPS243-A, Pi 5, Display) | $355 |
+| Core (OPS243, Pi 5, Display) | $355 |
 | Sound Trigger (SEN-14262 + resistor + wires) | $18 |
 | Angle Radar (2× K-LD7 + FTDI adapters) | $140 |
 | Power & Accessories | $27 |

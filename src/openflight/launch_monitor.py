@@ -205,15 +205,38 @@ class Shot:
         club_speed_mph: Peak club head speed detected (mph), if available
         smash_factor: Ratio of ball speed to club speed (typically 1.4-1.5 for driver)
         timestamp: When the shot was detected
-        impact_timestamp: Epoch timestamp of the peak ball reading from OPS243
+        impact_timestamp: Epoch timestamp aligned to impact/OPS trigger time
+        impact_timestamp_kld7: Ball-contact instant used by the K-LD7
+            geometry launch-angle estimator. This currently mirrors the
+            trusted hardware sound-trigger timestamp; OPS ball_timestamp_ms is
+            a radar-return position inside the capture and should not move
+            geometry t=0.
         peak_magnitude: Signal strength of strongest reading
         readings: All raw speed readings for this shot
         club: Club type for distance estimation
         launch_angle_vertical: Vertical launch angle in degrees (from camera)
         launch_angle_horizontal: Horizontal launch angle in degrees (from camera)
-        launch_angle_confidence: Confidence in launch angle measurement (0-1)
+        launch_angle_confidence: Backward-compatible primary launch angle confidence (0-1)
+        launch_angle_vertical_confidence: Confidence in vertical launch angle measurement
+        launch_angle_horizontal_confidence: Confidence in horizontal launch angle measurement
+        launch_angle_vertical_source: Source for vertical launch angle
+        launch_angle_horizontal_source: Source for horizontal launch angle
         spin_rpm: Spin rate in RPM (from rolling buffer mode)
         spin_confidence: Confidence in spin measurement (0-1)
+        spin_result_quality: Processor quality label for the spin detection
+        spin_snr: Signal-to-noise ratio of the spin envelope peak
+        spin_modulation_depth: Envelope std/mean inside the spin window
+        spin_peak_freq_hz: Frequency of the detected spin candidate
+        spin_seam_cycles: Number of spin cycles in the analysis window
+        spin_at_lower_rail: Whether the spin candidate hit the low search boundary
+        spin_at_upper_rail: Whether the spin candidate hit the high search boundary
+        spin_candidates: Ranked spin candidates for offline analysis
+        spin_phase_method: Phase confirmation method, if attempted
+        spin_phase_rpm: Phase-derived spin candidate, if available
+        spin_phase_snr: Phase-derived candidate SNR
+        spin_phase_agreement_pct: Envelope/phase agreement percentage
+        spin_phase_confirmed: Whether phase recovered a low-SNR spin
+        spin_rejection_reason: Why spin was withheld, if it was rejected
         carry_spin_adjusted: Carry distance adjusted for spin (yards)
         mode: Shot source — "streaming", "rolling-buffer", or "mock"
         readings_data: Serialized readings for session logging
@@ -222,15 +245,41 @@ class Shot:
     ball_speed_mph: float
     timestamp: datetime
     impact_timestamp: Optional[float] = None
+    impact_timestamp_kld7: Optional[float] = None
     club_speed_mph: Optional[float] = None
+    # Raw OPS radial ball speed, kept when the cosine correction rewrites
+    # ball_speed_mph (radar bin anchoring must keep using the radial value)
+    ball_speed_raw_mph: Optional[float] = None
     peak_magnitude: Optional[float] = None
     readings: List[SpeedReading] = field(default_factory=list)
     club: ClubType = ClubType.DRIVER
     launch_angle_vertical: Optional[float] = None
     launch_angle_horizontal: Optional[float] = None
     launch_angle_confidence: Optional[float] = None
+    launch_angle_vertical_confidence: Optional[float] = None
+    launch_angle_horizontal_confidence: Optional[float] = None
+    launch_angle_vertical_source: Optional[str] = None
+    launch_angle_horizontal_source: Optional[str] = None
     spin_rpm: Optional[float] = None
     spin_confidence: Optional[float] = None
+    # Raw radar-measured spin, kept when --calculated-spin rewrites
+    # spin_rpm with the kinematic estimate (for offline scoring)
+    spin_rpm_measured: Optional[float] = None
+    spin_source: Optional[str] = None  # "measured", "calculated", or None
+    spin_result_quality: Optional[str] = None
+    spin_snr: Optional[float] = None
+    spin_modulation_depth: Optional[float] = None
+    spin_peak_freq_hz: Optional[float] = None
+    spin_seam_cycles: Optional[float] = None
+    spin_at_lower_rail: Optional[bool] = None
+    spin_at_upper_rail: Optional[bool] = None
+    spin_candidates: Optional[list] = None
+    spin_phase_method: Optional[str] = None
+    spin_phase_rpm: Optional[float] = None
+    spin_phase_snr: Optional[float] = None
+    spin_phase_agreement_pct: Optional[float] = None
+    spin_phase_confirmed: bool = False
+    spin_rejection_reason: Optional[str] = None
     carry_spin_adjusted: Optional[float] = None
     mode: str = "rolling-buffer"
     readings_data: Optional[list] = None
@@ -314,6 +363,8 @@ class Shot:
         Returns:
             "high", "medium", "low", or None if no spin data
         """
+        if self.spin_rpm is not None and self.spin_result_quality:
+            return self.spin_result_quality
         if self.spin_confidence is None:
             return None
         if self.spin_confidence >= SPIN_CONFIDENCE_HIGH:
@@ -321,5 +372,3 @@ class Shot:
         if self.spin_confidence >= 0.4:
             return "medium"
         return "low"
-
-

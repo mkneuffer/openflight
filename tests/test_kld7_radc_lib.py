@@ -9,25 +9,35 @@ import pytest
 # Functions available in the package — prefer importing from there
 try:
     from openflight.kld7.radc import (
-        CFARDetection,
         ball_bin_range_from_speed,
         bin_to_velocity_kmh,
         cfar_detect,
+        circular_bin_distance,
         compute_spectrum,
+        expected_ball_bin_from_speed,
         extract_launch_angle,
+        find_impact_frames,
         parse_radc_payload,
+        radc_capture_diagnostics,
+        radc_frame_diagnostics,
+        select_best_shot_result,
         to_complex_iq,
     )
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent / "scripts" / "analysis"))
     from kld7_radc_lib import (
-        CFARDetection,
         ball_bin_range_from_speed,
         bin_to_velocity_kmh,
         cfar_detect,
+        circular_bin_distance,
         compute_spectrum,
+        expected_ball_bin_from_speed,
         extract_launch_angle,
+        find_impact_frames,
         parse_radc_payload,
+        radc_capture_diagnostics,
+        radc_frame_diagnostics,
+        select_best_shot_result,
         to_complex_iq,
     )
 
@@ -40,6 +50,80 @@ from kld7_radc_lib import (
     estimate_angle_from_phase,
     process_radc_frame,
 )
+
+
+def test_select_best_shot_result_prefers_geometry_over_later_naive_group():
+    results = [
+        {
+            "launch_angle_deg": 22.9,
+            "impact_frames": [38, 40],
+            "estimator": "geometry",
+            "frame_count": 2,
+            "confidence": 0.90,
+            "selection_path": "geometry_primary",
+        },
+        {
+            "launch_angle_deg": 10.6,
+            "impact_frames": [44, 48],
+            "estimator": "naive",
+            "frame_count": 4,
+            "confidence": 0.93,
+            "selection_path": "legacy_naive_suspect",
+        },
+    ]
+
+    assert select_best_shot_result(results)["launch_angle_deg"] == 22.9
+
+
+def test_select_best_shot_result_prefers_single_frame_geometry_over_later_naive_group():
+    results = [
+        {
+            "launch_angle_deg": 17.1,
+            "impact_frames": [39, 40],
+            "estimator": "geometry_single_frame",
+            "frame_count": 1,
+            "confidence": 0.72,
+            "selection_path": "geometry_single_frame",
+        },
+        {
+            "launch_angle_deg": 26.2,
+            "impact_frames": [47, 50],
+            "estimator": "naive",
+            "frame_count": 3,
+            "confidence": 0.54,
+            "selection_path": "legacy_naive_suspect",
+        },
+    ]
+
+    assert select_best_shot_result(results)["launch_angle_deg"] == 17.1
+
+
+def test_select_best_shot_result_uses_latest_group_as_same_tier_tiebreaker():
+    results = [
+        {
+            "launch_angle_deg": 14.0,
+            "impact_frames": [35, 38],
+            "estimator": "geometry_single_frame",
+            "frame_count": 1,
+            "confidence": 0.72,
+            "selection_path": "geometry_single_frame",
+        },
+        {
+            "launch_angle_deg": 18.5,
+            "impact_frames": [38, 40],
+            "estimator": "geometry_single_frame",
+            "frame_count": 1,
+            "confidence": 0.72,
+            "selection_path": "geometry_single_frame",
+        },
+    ]
+
+    assert select_best_shot_result(results)["launch_angle_deg"] == 18.5
+
+
+def test_select_best_shot_result_rejects_empty_results():
+    with pytest.raises(ValueError, match="at least one result"):
+        select_best_shot_result([])
 
 
 class TestParseRadcPayload:
@@ -207,21 +291,20 @@ class TestBallBinRangeFromSpeed:
         with hi-lo small (≈329 bins for ±10 mph tolerance).
         """
         ranges = ball_bin_range_from_speed(
-            ball_speed_mph=100.0, tolerance_mph=10.0,
-            fft_size=2048, max_speed_kmh=100.0,
+            ball_speed_mph=100.0,
+            tolerance_mph=10.0,
+            fft_size=2048,
+            max_speed_kmh=100.0,
         )
         assert isinstance(ranges, list), (
             "ball_bin_range_from_speed must return list[tuple[int,int]]"
         )
-        assert len(ranges) == 1, (
-            f"Non-wrapping case must return one range, got {ranges}"
-        )
+        assert len(ranges) == 1, f"Non-wrapping case must return one range, got {ranges}"
         lo, hi = ranges[0]
         assert lo < hi, "Single range must have lo < hi"
         width = hi - lo
         assert 200 < width < 500, (
-            f"Single ±10 mph band ≈ ±32 km/h × 10.24 bins/km/h ≈ 330 bins, "
-            f"got {width}"
+            f"Single ±10 mph band ≈ ±32 km/h × 10.24 bins/km/h ≈ 330 bins, got {width}"
         )
 
     def test_wraparound_band_returns_two_ranges(self):
@@ -230,13 +313,13 @@ class TestBallBinRangeFromSpeed:
         as TWO ranges: [0, +tol_bin] and [N-|tol_bin|, N].
         """
         ranges = ball_bin_range_from_speed(
-            ball_speed_mph=118.9, tolerance_mph=10.0,
-            fft_size=2048, max_speed_kmh=100.0,
+            ball_speed_mph=118.9,
+            tolerance_mph=10.0,
+            fft_size=2048,
+            max_speed_kmh=100.0,
         )
         assert isinstance(ranges, list)
-        assert len(ranges) == 2, (
-            f"Wrap-around case must return two ranges, got {ranges}"
-        )
+        assert len(ranges) == 2, f"Wrap-around case must return two ranges, got {ranges}"
         # Each sub-range must be a valid forward range.
         for lo, hi in ranges:
             assert 0 <= lo < hi <= 2048, (
@@ -255,6 +338,7 @@ class TestBallBinRangeFromSpeed:
         actually appears in the spectrum.
         """
         from openflight.kld7.radc import _velocity_to_bin
+
         ball_speed_mph = 118.9
         # Where the ball actually peaks
         ball_kmh = ball_speed_mph * 1.609
@@ -264,8 +348,10 @@ class TestBallBinRangeFromSpeed:
         expected_bin = _velocity_to_bin(aliased, 2048, 100.0)
 
         ranges = ball_bin_range_from_speed(
-            ball_speed_mph=ball_speed_mph, tolerance_mph=10.0,
-            fft_size=2048, max_speed_kmh=100.0,
+            ball_speed_mph=ball_speed_mph,
+            tolerance_mph=10.0,
+            fft_size=2048,
+            max_speed_kmh=100.0,
         )
         in_some_range = any(lo <= expected_bin < hi for lo, hi in ranges)
         assert in_some_range, (
@@ -283,6 +369,7 @@ class TestBallBinRangeFromSpeed:
         searched the correct (wrap-around) band.
         """
         from openflight.kld7.radc import _velocity_to_bin
+
         ball_speed_mph = 118.9
         ball_kmh = ball_speed_mph * 1.609
         aliased = ball_kmh % 200.0
@@ -344,7 +431,6 @@ class TestBallBinRangeFromSpeed:
         # giving recovered ≈ 136 mph), which is more than 10 bins from
         # the true target. After the fix the band wraps around DC and
         # the real peak at bin 1959 wins.
-        impact_frames = results[0].get("impact_frames", [])
         # Re-extract the per-frame peak bins from a quick rescan of
         # the test frame. We reach into the algorithm by checking the
         # recovered ball_speed_mph vs the OPS-anchored expected value.
@@ -404,8 +490,12 @@ class TestProcessRadcFrame:
         """A frame with an injected tone should produce at least one detection."""
         frame = self._make_frame(tone_bin=100)
         detections = process_radc_frame(
-            frame, frame_index=0, fft_size=2048, max_speed_kmh=100.0,
-            cfar_guard=32, cfar_training=32,
+            frame,
+            frame_index=0,
+            fft_size=2048,
+            max_speed_kmh=100.0,
+            cfar_guard=32,
+            cfar_training=32,
         )
         assert len(detections) >= 1
         assert all(isinstance(d, RADCDetection) for d in detections)
@@ -420,7 +510,10 @@ class TestProcessRadcFrame:
         payload[512:1024] = noise_q.tobytes()
         frame = {"timestamp": 1000.0, "radc": bytes(payload)}
         detections = process_radc_frame(
-            frame, frame_index=0, fft_size=2048, max_speed_kmh=100.0,
+            frame,
+            frame_index=0,
+            fft_size=2048,
+            max_speed_kmh=100.0,
             cfar_threshold=12.0,
         )
         assert len(detections) <= 3
@@ -468,6 +561,15 @@ class TestAngleBoundsValidation:
         results = extract_launch_angle([], orientation="horizontal")
         assert results == []
 
+    def test_horizontal_angle_limit_parameter_accepted(self):
+        """extract_launch_angle should accept a tunable horizontal bound."""
+        results = extract_launch_angle(
+            [],
+            orientation="horizontal",
+            horizontal_angle_limit_deg=30.0,
+        )
+        assert results == []
+
 
 class TestOpsBinSoftAnchor:
     """Tests for the OPS-expected-bin soft penalty in extract_launch_angle.
@@ -490,15 +592,16 @@ class TestOpsBinSoftAnchor:
 
     @staticmethod
     def _pack_payload(
-        f1a_iq: np.ndarray, f2a_iq: np.ndarray,
+        f1a_iq: np.ndarray,
+        f2a_iq: np.ndarray,
     ) -> bytes:
         """Pack complex I/Q into a 3072-byte RADC payload."""
         payload = bytearray(3072)
         for slot, iq in ((0, f1a_iq), (2, f2a_iq)):
             i_vals = (iq.real + ADC_MIDPOINT).astype(np.uint16)
             q_vals = (iq.imag + ADC_MIDPOINT).astype(np.uint16)
-            payload[slot * 512: (slot + 1) * 512] = i_vals.tobytes()
-            payload[(slot + 1) * 512: (slot + 2) * 512] = q_vals.tobytes()
+            payload[slot * 512 : (slot + 1) * 512] = i_vals.tobytes()
+            payload[(slot + 1) * 512 : (slot + 2) * 512] = q_vals.tobytes()
         return bytes(payload)
 
     @classmethod
@@ -561,14 +664,16 @@ class TestOpsBinSoftAnchor:
 
     @classmethod
     def _impact_window(
-        cls, center_frame: int, total: int, ball_frames: list[dict],
+        cls,
+        center_frame: int,
+        total: int,
+        ball_frames: list[dict],
     ) -> list[dict]:
         """Build a list of `total` synthesized RADC frames. Most are
         low-energy noise (so the impact detector's median energy
         baseline is non-zero); positions starting at `center_frame`
         get the supplied ball/clutter frames."""
-        out = [cls._noise_frame(ts=1000.0 + i * 0.056, seed=900 + i)
-               for i in range(total)]
+        out = [cls._noise_frame(ts=1000.0 + i * 0.056, seed=900 + i) for i in range(total)]
         for offset, frame in enumerate(ball_frames):
             idx = center_frame + offset
             if 0 <= idx < total:
@@ -594,12 +699,16 @@ class TestOpsBinSoftAnchor:
         activates when len(angs) >= 3), so the average reflects the
         soft-anchor weights cleanly."""
         a = cls._make_frame_at_bin(
-            peak_bin=ops_bin + anchor_offset, angle_deg=anchor_angle,
-            amplitude=8000.0, seed=101,
+            peak_bin=ops_bin + anchor_offset,
+            angle_deg=anchor_angle,
+            amplitude=8000.0,
+            seed=101,
         )
         b = cls._make_frame_at_bin(
-            peak_bin=ops_bin + outlier_offset, angle_deg=outlier_angle,
-            amplitude=8000.0, seed=202,
+            peak_bin=ops_bin + outlier_offset,
+            angle_deg=outlier_angle,
+            amplitude=8000.0,
+            seed=202,
         )
         # Place the two strong frames adjacent so the impact detector
         # groups them, and pad the rest with clones of the same frames
@@ -632,8 +741,10 @@ class TestOpsBinSoftAnchor:
         # Ball at OPS bin, +5°. Clutter +60 bins away, -25°.
         frames = self._two_strong_frames(
             ops_bin=ops_bin,
-            anchor_offset=0, anchor_angle=5.0,
-            outlier_offset=60, outlier_angle=-25.0,
+            anchor_offset=0,
+            anchor_angle=5.0,
+            outlier_offset=60,
+            outlier_angle=-25.0,
         )
 
         # impact_energy_threshold relative to median energy: with a
@@ -667,13 +778,9 @@ class TestOpsBinSoftAnchor:
         off = results_off[0]["launch_angle_deg"]
         # The penalty must move the answer toward +5 (anchor angle)
         # relative to the un-penalized baseline.
-        assert on > off, (
-            f"penalty should pull angle toward anchor; on={on:+.1f} "
-            f"off={off:+.1f}"
-        )
+        assert on > off, f"penalty should pull angle toward anchor; on={on:+.1f} off={off:+.1f}"
         assert abs(on - 5.0) < abs(off - 5.0), (
-            f"penalty result should be closer to +5 than baseline; "
-            f"on={on:+.1f} off={off:+.1f}"
+            f"penalty result should be closer to +5 than baseline; on={on:+.1f} off={off:+.1f}"
         )
 
     def test_no_penalty_when_ball_speed_unknown(self):
@@ -685,8 +792,10 @@ class TestOpsBinSoftAnchor:
         # without an OPS-anchored band.
         frames = self._two_strong_frames(
             ops_bin=1300,
-            anchor_offset=0, anchor_angle=10.0,
-            outlier_offset=500, outlier_angle=10.0,
+            anchor_offset=0,
+            anchor_angle=10.0,
+            outlier_offset=500,
+            outlier_angle=10.0,
         )
 
         results = extract_launch_angle(
@@ -713,12 +822,16 @@ class TestOpsBinSoftAnchor:
         # noise, so the resulting frames have low SNR (~2-3) and any
         # angle the algorithm reports has no physical meaning.
         far_a = self._make_frame_at_bin(
-            peak_bin=ops_bin + 600, angle_deg=-30.0,
-            amplitude=8000.0, seed=55,
+            peak_bin=ops_bin + 600,
+            angle_deg=-30.0,
+            amplitude=8000.0,
+            seed=55,
         )
         far_b = self._make_frame_at_bin(
-            peak_bin=ops_bin + 610, angle_deg=-30.0,
-            amplitude=8000.0, seed=66,
+            peak_bin=ops_bin + 610,
+            angle_deg=-30.0,
+            amplitude=8000.0,
+            seed=66,
         )
         frames = [
             dict(far_a, timestamp=1.0),
@@ -754,6 +867,7 @@ class TestOpsBinSoftAnchor:
         problem.
         """
         import logging
+
         ops_speed_mph = 70.0
         ops_bin = 1163
 
@@ -761,8 +875,10 @@ class TestOpsBinSoftAnchor:
         # so >50% of surviving frames will be penalized.
         frames = self._two_strong_frames(
             ops_bin=ops_bin,
-            anchor_offset=60, anchor_angle=-10.0,
-            outlier_offset=80, outlier_angle=-12.0,
+            anchor_offset=60,
+            anchor_angle=-10.0,
+            outlier_offset=80,
+            outlier_angle=-12.0,
         )
 
         with caplog.at_level(logging.WARNING, logger="openflight.kld7.radc"):
@@ -776,7 +892,8 @@ class TestOpsBinSoftAnchor:
             )
 
         warns = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if r.levelno == logging.WARNING and "OPS-bin penalty" in r.message
         ]
         assert warns, (
@@ -787,6 +904,135 @@ class TestOpsBinSoftAnchor:
         assert "peak bins:" in warns[0].message
         # And reference the troubleshooting doc
         assert "troubleshooting" in warns[0].message
+
+    def test_vertical_rule_stack_prefers_rising_previous_pair(self, caplog):
+        """Vertical rule stack should select previous+anchor when the pair rises.
+
+        Scenario:
+          - frame at 23ms: weaker, in-bin, lower angle
+          - frame at 57ms: strongest anchor, in-bin
+          - frame at 91ms: also strong, but selected pair should still be
+            previous->anchor according to the rule stack.
+        """
+        import logging
+
+        ops_speed_mph = 108.0
+        ops_bin = expected_ball_bin_from_speed(ops_speed_mph)
+        impact_t = 1000.0
+
+        frames = [
+            self._noise_frame(ts=impact_t - 0.22, seed=301),
+            self._noise_frame(ts=impact_t - 0.10, seed=302),
+            self._make_frame_at_bin(
+                peak_bin=ops_bin + 18,
+                angle_deg=-12.0,
+                amplitude=6800.0,
+                seed=303,
+                ts=impact_t + 0.023,
+            ),
+            self._make_frame_at_bin(
+                peak_bin=ops_bin,
+                angle_deg=-8.0,
+                amplitude=9800.0,
+                seed=304,
+                ts=impact_t + 0.057,
+            ),
+            self._make_frame_at_bin(
+                peak_bin=ops_bin,
+                angle_deg=-6.0,
+                amplitude=8600.0,
+                seed=305,
+                ts=impact_t + 0.091,
+            ),
+            self._noise_frame(ts=impact_t + 0.16, seed=306),
+        ]
+
+        with caplog.at_level(logging.INFO, logger="openflight.kld7.radc"):
+            results = extract_launch_angle(
+                frames=frames,
+                ops243_ball_speed_mph=ops_speed_mph,
+                speed_tolerance_mph=10.0,
+                impact_energy_threshold=0.5,
+                orientation="vertical",
+                angle_offset_deg=18.0,
+                impact_timestamp=impact_t,
+            )
+
+        assert results, "expected a vertical launch result from synthetic frames"
+        assert results[0]["frame_count"] == 2
+        assert any("Pair winner" in rec.message for rec in caplog.records), (
+            "expected rule-stack logs to include the winning pair"
+        )
+
+    def test_high_rmse_geometry_pair_falls_back_to_earliest_single_frame(self):
+        """A noisy second bearing should not keep a high-RMSE two-frame fit.
+
+        This mirrors the indoor-screen failure mode where an early OPS-bin
+        frame is a clean ball return, but the adjacent later frame has a
+        plausible bin/SNR and an inconsistent bearing. The pair should be
+        categorized as a capped-confidence single-frame geometry result.
+        """
+        from openflight.kld7.geometry import predicted_bearing_deg
+
+        ops_speed_mph = 108.0
+        ops_bin = expected_ball_bin_from_speed(ops_speed_mph)
+        impact_t = 1000.0
+        distance_ft = 5.0
+        mount_deg = 10.0
+        clean_launch_deg = 20.0
+        clean_t = 0.028
+        contaminated_t = 0.064
+
+        clean_bearing = predicted_bearing_deg(
+            clean_launch_deg,
+            clean_t,
+            ops_speed_mph,
+            distance_ft,
+            mount_deg,
+        )
+
+        frames = [
+            self._noise_frame(ts=impact_t - 0.20, seed=401),
+            self._noise_frame(ts=impact_t - 0.10, seed=402),
+            self._make_frame_at_bin(
+                peak_bin=ops_bin,
+                angle_deg=clean_bearing,
+                amplitude=8000.0,
+                seed=403,
+                ts=impact_t + clean_t,
+            ),
+            self._make_frame_at_bin(
+                peak_bin=ops_bin,
+                angle_deg=16.0,
+                amplitude=14000.0,
+                seed=404,
+                ts=impact_t + contaminated_t,
+            ),
+            self._noise_frame(ts=impact_t + 0.16, seed=405),
+        ]
+
+        results = extract_launch_angle(
+            frames=frames,
+            ops243_ball_speed_mph=ops_speed_mph,
+            speed_tolerance_mph=10.0,
+            impact_energy_threshold=0.5,
+            orientation="vertical",
+            vertical_estimator="geometry",
+            impact_timestamp=impact_t,
+            mount_deg=mount_deg,
+            distance_ft=distance_ft,
+        )
+
+        assert results
+        best = results[0]
+        assert best["estimator"] == "geometry_single_frame"
+        assert best["selection_path"] == "geometry_single_frame"
+        assert best["frame_count"] == 1
+        assert best["selected_frame_indices"] == [2]
+        assert best["geom_fit_rmse_deg"] is None
+        assert best["geom_single_frame_resid_deg"] is not None
+        assert best["confidence"] <= 0.72
+        assert best["launch_angle_deg"] == pytest.approx(clean_launch_deg, abs=1.0)
 
 
 class TestMultiBinCentroidAngle:
@@ -807,8 +1053,8 @@ class TestMultiBinCentroidAngle:
         for slot, iq in ((0, f1a_iq), (2, f2a_iq)):
             i_vals = (iq.real + ADC_MIDPOINT).astype(np.uint16)
             q_vals = (iq.imag + ADC_MIDPOINT).astype(np.uint16)
-            payload[slot * 512: (slot + 1) * 512] = i_vals.tobytes()
-            payload[(slot + 1) * 512: (slot + 2) * 512] = q_vals.tobytes()
+            payload[slot * 512 : (slot + 1) * 512] = i_vals.tobytes()
+            payload[(slot + 1) * 512 : (slot + 2) * 512] = q_vals.tobytes()
         return bytes(payload)
 
     @staticmethod
@@ -819,7 +1065,10 @@ class TestMultiBinCentroidAngle:
 
     @classmethod
     def _make_clean_tone_frame(
-        cls, peak_bin: int, angle_deg: float, seed: int,
+        cls,
+        peak_bin: int,
+        angle_deg: float,
+        seed: int,
     ) -> dict:
         """Single-tone, very low noise. The peak bin will dominate
         such that the half-power window contains effectively only the
@@ -837,13 +1086,18 @@ class TestMultiBinCentroidAngle:
         return {
             "timestamp": 1000.0,
             "radc": cls._pack_two_channel_payload(
-                signal + noise1, signal * np.exp(-1j * delta) + noise2,
+                signal + noise1,
+                signal * np.exp(-1j * delta) + noise2,
             ),
         }
 
     @classmethod
     def _make_spread_target_frame(
-        cls, peak_bin: int, angle_deg: float, spread_bins: int, seed: int,
+        cls,
+        peak_bin: int,
+        angle_deg: float,
+        spread_bins: int,
+        seed: int,
     ) -> dict:
         """Wide-shoulder target: the same angle present at multiple
         adjacent bins (simulating a range-spread / Doppler-spread ball).
@@ -885,14 +1139,20 @@ class TestMultiBinCentroidAngle:
             dict(b, timestamp=4.0),
         ]
         results_centroid = extract_launch_angle(
-            frames=frames, ops243_ball_speed_mph=70.0,
-            speed_tolerance_mph=40.0, impact_energy_threshold=0.5,
-            orientation=None, centroid_floor_frac=0.5,
+            frames=frames,
+            ops243_ball_speed_mph=70.0,
+            speed_tolerance_mph=40.0,
+            impact_energy_threshold=0.5,
+            orientation=None,
+            centroid_floor_frac=0.5,
         )
         results_peak = extract_launch_angle(
-            frames=frames, ops243_ball_speed_mph=70.0,
-            speed_tolerance_mph=40.0, impact_energy_threshold=0.5,
-            orientation=None, centroid_floor_frac=1.0,  # legacy single-bin
+            frames=frames,
+            ops243_ball_speed_mph=70.0,
+            speed_tolerance_mph=40.0,
+            impact_energy_threshold=0.5,
+            orientation=None,
+            centroid_floor_frac=1.0,  # legacy single-bin
         )
         assert results_centroid and results_peak
         ang_centroid = results_centroid[0]["launch_angle_deg"]
@@ -902,9 +1162,7 @@ class TestMultiBinCentroidAngle:
             f"peak={ang_peak:+.2f} (should be near-identical)"
         )
         # And both should be near the injected +8°
-        assert abs(ang_centroid - 8.0) < 2.0, (
-            f"clean tone: expected ~+8°, got {ang_centroid:+.2f}"
-        )
+        assert abs(ang_centroid - 8.0) < 2.0, f"clean tone: expected ~+8°, got {ang_centroid:+.2f}"
 
     def test_spread_target_centroid_more_robust_than_peak_bin(self):
         """For a range-spread target the centroid should be at least as
@@ -914,10 +1172,16 @@ class TestMultiBinCentroidAngle:
         legacy peak-bin path on the spread case."""
         ops_bin = 1163
         a = self._make_spread_target_frame(
-            ops_bin, angle_deg=10.0, spread_bins=4, seed=101,
+            ops_bin,
+            angle_deg=10.0,
+            spread_bins=4,
+            seed=101,
         )
         b = self._make_spread_target_frame(
-            ops_bin, angle_deg=10.0, spread_bins=4, seed=202,
+            ops_bin,
+            angle_deg=10.0,
+            spread_bins=4,
+            seed=202,
         )
         frames = [
             dict(a, timestamp=1.0),
@@ -926,15 +1190,16 @@ class TestMultiBinCentroidAngle:
             dict(b, timestamp=4.0),
         ]
         results = extract_launch_angle(
-            frames=frames, ops243_ball_speed_mph=70.0,
-            speed_tolerance_mph=40.0, impact_energy_threshold=0.5,
-            orientation=None, centroid_floor_frac=0.5,
+            frames=frames,
+            ops243_ball_speed_mph=70.0,
+            speed_tolerance_mph=40.0,
+            impact_energy_threshold=0.5,
+            orientation=None,
+            centroid_floor_frac=0.5,
         )
         assert results
         ang = results[0]["launch_angle_deg"]
-        assert abs(ang - 10.0) < 3.0, (
-            f"spread target: expected ~+10°, centroid got {ang:+.2f}"
-        )
+        assert abs(ang - 10.0) < 3.0, f"spread target: expected ~+10°, centroid got {ang:+.2f}"
 
     def test_centroid_floor_one_reverts_to_legacy(self):
         """Setting centroid_floor_frac=1.0 must reproduce the legacy
@@ -949,17 +1214,233 @@ class TestMultiBinCentroidAngle:
             dict(f, timestamp=4.0),
         ]
         legacy = extract_launch_angle(
-            frames=frames, ops243_ball_speed_mph=70.0,
-            speed_tolerance_mph=40.0, impact_energy_threshold=0.5,
-            orientation=None, centroid_floor_frac=1.0,
+            frames=frames,
+            ops243_ball_speed_mph=70.0,
+            speed_tolerance_mph=40.0,
+            impact_energy_threshold=0.5,
+            orientation=None,
+            centroid_floor_frac=1.0,
         )
         # Same call again — must be deterministic
         legacy2 = extract_launch_angle(
-            frames=frames, ops243_ball_speed_mph=70.0,
-            speed_tolerance_mph=40.0, impact_energy_threshold=0.5,
-            orientation=None, centroid_floor_frac=1.0,
+            frames=frames,
+            ops243_ball_speed_mph=70.0,
+            speed_tolerance_mph=40.0,
+            impact_energy_threshold=0.5,
+            orientation=None,
+            centroid_floor_frac=1.0,
         )
         assert legacy and legacy2
         assert legacy[0]["launch_angle_deg"] == legacy2[0]["launch_angle_deg"]
         # And it should be very near +4°
         assert abs(legacy[0]["launch_angle_deg"] - 4.0) < 2.0
+
+
+class TestRawADCDiagnostics:
+    """Tests for frame-level raw ADC diagnostics."""
+
+    def test_expected_bin_uses_circular_distance_at_fft_wrap(self):
+        """OPS bin comparisons should treat bin 0 and bin N-1 as adjacent."""
+        assert circular_bin_distance(2047, 2, fft_size=2048) == 3
+
+    def test_frame_diagnostics_reports_peak_angle_and_coherence(self):
+        """A clean synthetic ball tone should yield strong frame diagnostics."""
+        ball_speed_mph = 70.0
+        expected_bin = expected_ball_bin_from_speed(ball_speed_mph)
+        frame = TestOpsBinSoftAnchor._make_frame_at_bin(
+            peak_bin=expected_bin,
+            angle_deg=7.0,
+            amplitude=8000.0,
+            seed=123,
+        )
+
+        diag = radc_frame_diagnostics(
+            frame,
+            frame_index=4,
+            ops243_ball_speed_mph=ball_speed_mph,
+            speed_tolerance_mph=40.0,
+            orientation="vertical",
+        )
+
+        assert diag.valid_payload
+        assert diag.expected_bin == expected_bin
+        assert diag.peak_bin is not None
+        assert abs(diag.peak_bin - expected_bin) <= 2
+        assert diag.bin_error is not None and diag.bin_error <= 2
+        assert diag.speed_error_mph is not None and abs(diag.speed_error_mph) < 1.0
+        assert diag.snr_linear > 10.0
+        assert diag.phase_coherence is not None and diag.phase_coherence > 0.8
+        assert diag.angle_centroid_deg is not None
+        assert abs(diag.angle_centroid_deg - 7.0) < 2.0
+
+        as_dict = diag.to_dict()
+        assert as_dict["channel_stats"]["f1a_i"]["std"] > 0
+        assert as_dict["iq_stats"]["f1a"]["q_to_i_std_ratio"] > 0
+
+    def test_frame_diagnostics_handles_missing_and_invalid_payloads(self):
+        missing = radc_frame_diagnostics({"timestamp": 1.0}, frame_index=0)
+        assert not missing.valid_payload
+        assert missing.reason == "missing_radc"
+        assert "missing_radc" in missing.warnings
+
+        invalid = radc_frame_diagnostics({"timestamp": 1.0, "radc": b"\x00" * 10})
+        assert not invalid.valid_payload
+        assert invalid.reason == "invalid_payload_size"
+        assert "invalid_payload" in invalid.warnings
+
+    def test_capture_diagnostics_summarizes_peak_bins_and_warnings(self):
+        ball_speed_mph = 70.0
+        expected_bin = expected_ball_bin_from_speed(ball_speed_mph)
+        frames = [
+            TestOpsBinSoftAnchor._make_frame_at_bin(
+                peak_bin=expected_bin,
+                angle_deg=5.0,
+                amplitude=8000.0,
+                seed=11,
+            ),
+            {"timestamp": 2.0},
+        ]
+
+        diagnostics, summary = radc_capture_diagnostics(
+            frames,
+            ops243_ball_speed_mph=ball_speed_mph,
+            speed_tolerance_mph=40.0,
+        )
+
+        assert len(diagnostics) == 2
+        assert summary["frame_count"] == 2
+        assert summary["valid_payload_count"] == 1
+        assert summary["peak_frame_count"] == 1
+        assert summary["expected_bin"] == expected_bin
+        assert summary["median_abs_bin_error"] is not None
+        assert summary["median_abs_bin_error"] <= 2
+        assert summary["median_abs_speed_error_mph"] is not None
+        assert summary["median_abs_speed_error_mph"] < 1.0
+        assert summary["warnings_by_type"]["missing_radc"] == 1
+        assert summary["peak_bin_histogram_top"][0]["bin"] == diagnostics[0].peak_bin
+
+    def test_extraction_skips_invalid_payloads(self):
+        ball_speed_mph = 70.0
+        expected_bin = expected_ball_bin_from_speed(ball_speed_mph)
+        frames = TestOpsBinSoftAnchor._impact_window(
+            center_frame=4,
+            total=12,
+            ball_frames=[
+                TestOpsBinSoftAnchor._make_frame_at_bin(
+                    peak_bin=expected_bin,
+                    angle_deg=6.0,
+                    amplitude=9000.0,
+                    seed=31,
+                ),
+                {"timestamp": 1000.28, "radc": b"\x00" * 3045},
+                TestOpsBinSoftAnchor._make_frame_at_bin(
+                    peak_bin=expected_bin,
+                    angle_deg=6.0,
+                    amplitude=9000.0,
+                    seed=32,
+                ),
+            ],
+        )
+
+        impact_indices = find_impact_frames(
+            frames,
+            ball_bands=[(expected_bin - 20, expected_bin + 21)],
+            energy_threshold=1.5,
+        )
+        results = extract_launch_angle(
+            frames,
+            ops243_ball_speed_mph=ball_speed_mph,
+            speed_tolerance_mph=5.0,
+            impact_energy_threshold=1.5,
+            orientation="horizontal",
+        )
+
+        assert impact_indices
+        assert results
+        assert results[0]["launch_angle_deg"] == pytest.approx(6.0, abs=3.0)
+
+    def test_horizontal_angle_limit_can_accept_wider_trackman_replay_target(self):
+        """The default ±15° horizontal bound is tunable for TrackMan replay."""
+        ball_speed_mph = 95.0
+        expected_bin = expected_ball_bin_from_speed(ball_speed_mph)
+        frames = TestOpsBinSoftAnchor._impact_window(
+            center_frame=4,
+            total=12,
+            ball_frames=[
+                TestOpsBinSoftAnchor._make_frame_at_bin(
+                    peak_bin=expected_bin,
+                    angle_deg=20.0,
+                    amplitude=9000.0,
+                    seed=41,
+                ),
+                TestOpsBinSoftAnchor._make_frame_at_bin(
+                    peak_bin=expected_bin,
+                    angle_deg=20.0,
+                    amplitude=9000.0,
+                    seed=42,
+                ),
+            ],
+        )
+
+        default_results = extract_launch_angle(
+            frames,
+            ops243_ball_speed_mph=ball_speed_mph,
+            speed_tolerance_mph=5.0,
+            impact_energy_threshold=1.5,
+            orientation="horizontal",
+        )
+        wide_results = extract_launch_angle(
+            frames,
+            ops243_ball_speed_mph=ball_speed_mph,
+            speed_tolerance_mph=5.0,
+            impact_energy_threshold=1.5,
+            orientation="horizontal",
+            horizontal_angle_limit_deg=30.0,
+        )
+
+        assert default_results == []
+        assert wide_results
+        assert wide_results[0]["launch_angle_deg"] == pytest.approx(20.0, abs=3.0)
+
+    def test_horizontal_ops_anchored_min_snr_can_accept_weak_near_ops_peak(self):
+        """Replay can lower the OPS-local SNR gate without changing defaults."""
+        ball_speed_mph = 95.0
+        expected_bin = expected_ball_bin_from_speed(ball_speed_mph)
+        frames = TestOpsBinSoftAnchor._impact_window(
+            center_frame=4,
+            total=12,
+            ball_frames=[
+                TestOpsBinSoftAnchor._make_frame_at_bin(
+                    peak_bin=expected_bin,
+                    angle_deg=6.0,
+                    amplitude=30.0,
+                    seed=100,
+                ),
+                TestOpsBinSoftAnchor._make_frame_at_bin(
+                    peak_bin=expected_bin,
+                    angle_deg=6.0,
+                    amplitude=30.0,
+                    seed=101,
+                ),
+            ],
+        )
+
+        default_results = extract_launch_angle(
+            frames,
+            ops243_ball_speed_mph=ball_speed_mph,
+            speed_tolerance_mph=5.0,
+            impact_energy_threshold=1.5,
+            orientation="horizontal",
+        )
+        relaxed_results = extract_launch_angle(
+            frames,
+            ops243_ball_speed_mph=ball_speed_mph,
+            speed_tolerance_mph=5.0,
+            impact_energy_threshold=1.5,
+            orientation="horizontal",
+            ops_anchored_peak_min_snr=2.0,
+        )
+
+        assert default_results == []
+        assert relaxed_results
+        assert relaxed_results[0]["launch_angle_deg"] == pytest.approx(6.0, abs=3.0)

@@ -11,10 +11,10 @@ Tracking options:
 
 from .capture import (
     CameraCapture,
-    MockCameraCapture,
     CaptureConfig,
     CapturedFrame,
     CaptureResult,
+    MockCameraCapture,
 )
 from .detector import (
     BallDetector,
@@ -22,18 +22,20 @@ from .detector import (
     DetectorConfig,
 )
 from .launch_angle import (
+    CameraCalibration,
     LaunchAngleCalculator,
     LaunchAngles,
-    CameraCalibration,
 )
+
 try:
     from .tracker import (
         BallTracker,
+        BallTrajectory,
         HybridBallTracker,
         TrackedBall,
-        BallTrajectory,
         TrackerConfig,
     )
+
     _TRACKER_AVAILABLE = True
 except ImportError:
     _TRACKER_AVAILABLE = False

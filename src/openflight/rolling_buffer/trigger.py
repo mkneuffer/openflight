@@ -29,6 +29,8 @@ class TriggerStrategy(ABC):
     Different strategies trade off between simplicity, reliability, and efficiency.
     """
 
+    MIN_VALID_OUTBOUND_MPH = 15.0
+
     def __init__(self, pre_trigger_segments: int = 12):
         self._diagnostics: List[dict] = []
         self.pre_trigger_segments = pre_trigger_segments
@@ -79,11 +81,62 @@ class TriggerStrategy(ABC):
             entry["trigger_latency_ms"] = trigger_latency_ms
         self._diagnostics.append(entry)
 
-    def _log_capture(self, capture: IQCapture, accepted: bool):
-        """No-op: capture logging moved to monitor (with processed speed data).
+    def _summarize_capture_activity(
+        self,
+        processor: RollingBufferProcessor,
+        capture: IQCapture,
+    ) -> dict:
+        """Summarize movement in a capture before accepting a sound trigger."""
+        timeline = processor.process_standard(capture)
+        all_readings = timeline.readings
+        all_outbound = [r for r in all_readings if r.is_outbound]
+        all_inbound = [r for r in all_readings if not r.is_outbound]
+        outbound_speeds = [r.speed_mph for r in all_outbound]
+        inbound_speeds = [r.speed_mph for r in all_inbound]
+        valid_outbound = [r for r in all_outbound if r.speed_mph >= self.MIN_VALID_OUTBOUND_MPH]
 
-        Kept as no-op to avoid breaking subclass call sites.
-        """
+        return {
+            "total_readings": len(all_readings),
+            "outbound_readings": len(all_outbound),
+            "inbound_readings": len(all_inbound),
+            "peak_outbound_mph": max(outbound_speeds, default=0),
+            "peak_inbound_mph": max(inbound_speeds, default=0),
+            "all_outbound_speeds": outbound_speeds,
+            "all_inbound_speeds": inbound_speeds,
+            "peak_outbound_magnitude": max((r.magnitude for r in all_outbound), default=0),
+            "peak_inbound_magnitude": max((r.magnitude for r in all_inbound), default=0),
+            "valid_outbound_count": len(valid_outbound),
+            "valid_peak_outbound_mph": max(
+                (r.speed_mph for r in valid_outbound),
+                default=0,
+            ),
+        }
+
+    def _append_activity_diagnostic(
+        self,
+        summary: dict,
+        *,
+        accepted: bool,
+        reason: str,
+        response_bytes: int,
+        trigger_latency_ms: Optional[float] = None,
+    ):
+        """Append a diagnostic entry using capture-activity summary fields."""
+        self._append_diagnostic(
+            accepted=accepted,
+            reason=reason,
+            response_bytes=response_bytes,
+            total_readings=summary["total_readings"],
+            outbound_readings=summary["outbound_readings"],
+            inbound_readings=summary["inbound_readings"],
+            peak_outbound_mph=summary["peak_outbound_mph"],
+            peak_inbound_mph=summary["peak_inbound_mph"],
+            all_outbound_speeds=summary["all_outbound_speeds"],
+            all_inbound_speeds=summary["all_inbound_speeds"],
+            peak_outbound_magnitude=summary["peak_outbound_magnitude"],
+            peak_inbound_magnitude=summary["peak_inbound_magnitude"],
+            trigger_latency_ms=trigger_latency_ms,
+        )
 
     @abstractmethod
     def wait_for_trigger(
@@ -170,12 +223,19 @@ class PollingTrigger(TriggerStrategy):
                 timeline = processor.process_standard(capture)
 
                 # Check for significant activity
-                outbound = [r for r in timeline.readings
-                            if r.is_outbound and r.speed_mph >= self.min_speed_mph]
+                outbound = [
+                    r
+                    for r in timeline.readings
+                    if r.is_outbound and r.speed_mph >= self.min_speed_mph
+                ]
 
                 if len(outbound) >= self.min_readings:
                     peak = max(r.speed_mph for r in outbound)
-                    logger.info("[TRIGGER] Activity detected: %d readings, peak %.1f mph", len(outbound), peak)
+                    logger.info(
+                        "[TRIGGER] Activity detected: %d readings, peak %.1f mph",
+                        len(outbound),
+                        peak,
+                    )
                     return capture
 
                 time.sleep(self.poll_interval)
@@ -258,8 +318,11 @@ class ThresholdTrigger(TriggerStrategy):
 
                 peak = timeline.peak_speed
                 if peak and peak.is_outbound and peak.speed_mph >= self.speed_threshold_mph:
-                    logger.info("[TRIGGER] Threshold triggered: %.1f mph >= %.1f mph",
-                               peak.speed_mph, self.speed_threshold_mph)
+                    logger.info(
+                        "[TRIGGER] Threshold triggered: %.1f mph >= %.1f mph",
+                        peak.speed_mph,
+                        self.speed_threshold_mph,
+                    )
                     self._triggered = True
 
                     # Brief settling time for ball to clear
@@ -404,7 +467,9 @@ class SpeedTriggeredCapture(TriggerStrategy):
             time.sleep(0.1)
 
         start_time = time.time()
-        logger.info("[TRIGGER] Waiting for speed trigger >= %.1f mph...", self.min_trigger_speed_mph)
+        logger.info(
+            "[TRIGGER] Waiting for speed trigger >= %.1f mph...", self.min_trigger_speed_mph
+        )
 
         while (time.time() - start_time) < timeout:
             # Non-blocking speed read
@@ -415,8 +480,11 @@ class SpeedTriggeredCapture(TriggerStrategy):
                 self._last_trigger_speed = reading.speed
                 trigger_time = time.time()
 
-                logger.info("[TRIGGER] Speed trigger: %.1f mph %s detected, switching to rolling buffer...",
-                           reading.speed, reading.direction.value)
+                logger.info(
+                    "[TRIGGER] Speed trigger: %.1f mph %s detected, switching to rolling buffer...",
+                    reading.speed,
+                    reading.direction.value,
+                )
 
                 # Immediately switch to rolling buffer mode
                 radar.switch_to_rolling_buffer()
@@ -438,8 +506,11 @@ class SpeedTriggeredCapture(TriggerStrategy):
                 if capture:
                     # Validate capture has ball speed
                     timeline = processor.process_standard(capture)
-                    outbound = [r for r in timeline.readings
-                               if r.is_outbound and r.speed_mph >= self.min_ball_speed_mph]
+                    outbound = [
+                        r
+                        for r in timeline.readings
+                        if r.is_outbound and r.speed_mph >= self.min_ball_speed_mph
+                    ]
 
                     if outbound:
                         peak = max(r.speed_mph for r in outbound)
@@ -449,7 +520,9 @@ class SpeedTriggeredCapture(TriggerStrategy):
                         self._needs_reconfigure = True
                         return capture
                     else:
-                        logger.info("[TRIGGER] No speed >= %.1f mph in capture", self.min_ball_speed_mph)
+                        logger.info(
+                            "[TRIGGER] No speed >= %.1f mph in capture", self.min_ball_speed_mph
+                        )
 
                 # Reconfigure for speed mode and continue
                 self._needs_reconfigure = True
@@ -529,24 +602,23 @@ class GPIOSoundTrigger(TriggerStrategy):
         try:
             from gpiozero import Button  # pylint: disable=import-outside-toplevel
         except ImportError:
-            logger.error("[TRIGGER] gpiozero not available. Install with: uv pip install gpiozero lgpio")
+            logger.error(
+                "[TRIGGER] gpiozero not available. Install with: uv pip install gpiozero lgpio"
+            )
             return False
 
         def on_trigger():
             self._trigger_event["edge_time"] = time.time()
             self._trigger_event["triggered"] = True
 
-        self._button = Button(
-            self.gpio_pin,
-            pull_up=False,
-            bounce_time=self.debounce_ms / 1000.0
-        )
+        self._button = Button(self.gpio_pin, pull_up=False, bounce_time=self.debounce_ms / 1000.0)
         self._button.when_pressed = on_trigger
         self._gpio_initialized = True
 
         logger.info(
             "[TRIGGER] GPIO%d configured for sound trigger (debounce=%dms)",
-            self.gpio_pin, self.debounce_ms
+            self.gpio_pin,
+            self.debounce_ms,
         )
         return True
 
@@ -571,7 +643,9 @@ class GPIOSoundTrigger(TriggerStrategy):
 
         logger.info(
             "[TRIGGER] Waiting for GPIO sound trigger on GPIO%d (timeout=%.0fs, S#%s)...",
-            self.gpio_pin, timeout, self.pre_trigger_segments
+            self.gpio_pin,
+            timeout,
+            self.pre_trigger_segments,
         )
 
         start_time = time.time()
@@ -584,13 +658,18 @@ class GPIOSoundTrigger(TriggerStrategy):
 
                 # Measure edge-to-S! latency (from GPIO callback to now)
                 trigger_latency = (time.time() - edge_time) * 1000
-                logger.info("[TRIGGER] GPIO edge detected on GPIO%d (%.1fms ago), sending S! trigger...",
-                           self.gpio_pin, trigger_latency)
+                logger.info(
+                    "[TRIGGER] GPIO edge detected on GPIO%d (%.1fms ago), sending S! trigger...",
+                    self.gpio_pin,
+                    trigger_latency,
+                )
                 response = radar.trigger_capture(timeout=5.0)
 
                 if not response:
-                    logger.warning("[TRIGGER] No response from radar after S! (%.1fms after edge)",
-                                  trigger_latency)
+                    logger.warning(
+                        "[TRIGGER] No response from radar after S! (%.1fms after edge)",
+                        trigger_latency,
+                    )
                     self._append_diagnostic(
                         accepted=False,
                         reason="no_response",
@@ -603,8 +682,11 @@ class GPIOSoundTrigger(TriggerStrategy):
                     continue
 
                 response_len = len(response)
-                logger.info("[TRIGGER] Capture received, %d bytes (S! sent %.1fms after edge)",
-                           response_len, trigger_latency)
+                logger.info(
+                    "[TRIGGER] Capture received, %d bytes (S! sent %.1fms after edge)",
+                    response_len,
+                    trigger_latency,
+                )
                 if response_len < 5000:
                     logger.debug("[TRIGGER] Response content: %s", repr(response))
                 else:
@@ -627,66 +709,36 @@ class GPIOSoundTrigger(TriggerStrategy):
                     )
                     continue
 
-                # Log raw I/Q for ALL triggers (accepted or rejected) for offline analysis
-                self._log_capture(capture, accepted=False)  # updated to True below if accepted
-
                 # Quick validation: does the capture contain any real swing data?
-                timeline = processor.process_standard(capture)
-                all_readings = timeline.readings
-                all_outbound = [r for r in all_readings if r.is_outbound]
-                all_inbound = [r for r in all_readings if not r.is_outbound]
-                outbound_speeds = [r.speed_mph for r in all_outbound]
-                inbound_speeds = [r.speed_mph for r in all_inbound]
-                peak_outbound = max(outbound_speeds, default=0)
-                peak_inbound = max(inbound_speeds, default=0)
-                peak_out_mag = max((r.magnitude for r in all_outbound), default=0)
-                peak_in_mag = max((r.magnitude for r in all_inbound), default=0)
+                summary = self._summarize_capture_activity(processor, capture)
 
-                outbound_valid = [
-                    r for r in all_outbound if r.speed_mph >= 15.0
-                ]
-
-                if not outbound_valid:
+                if not summary["valid_outbound_count"]:
                     logger.info(
-                        "[TRIGGER] GPIO trigger rejected — no outbound speed >= 15 mph "
+                        "[TRIGGER] GPIO trigger rejected — no outbound speed >= %.0f mph "
                         "(peak=%.1f mph, %d readings)",
-                        peak_outbound, len(all_readings)
+                        self.MIN_VALID_OUTBOUND_MPH,
+                        summary["peak_outbound_mph"],
+                        summary["total_readings"],
                     )
-                    self._append_diagnostic(
+                    self._append_activity_diagnostic(
+                        summary,
                         accepted=False,
                         reason="no_outbound_speed",
                         response_bytes=response_len,
-                        total_readings=len(all_readings),
-                        outbound_readings=len(all_outbound),
-                        inbound_readings=len(all_inbound),
-                        peak_outbound_mph=peak_outbound,
-                        peak_inbound_mph=peak_inbound,
-                        all_outbound_speeds=outbound_speeds,
-                        all_inbound_speeds=inbound_speeds,
-                        peak_outbound_magnitude=peak_out_mag,
-                        peak_inbound_magnitude=peak_in_mag,
                         trigger_latency_ms=trigger_latency,
                     )
                     continue
 
-                peak = max(r.speed_mph for r in outbound_valid)
                 logger.info(
                     "[TRIGGER] GPIO trigger accepted — peak %.1f mph, %d outbound readings",
-                    peak, len(outbound_valid)
+                    summary["valid_peak_outbound_mph"],
+                    summary["valid_outbound_count"],
                 )
-                self._append_diagnostic(
+                self._append_activity_diagnostic(
+                    summary,
                     accepted=True,
                     reason="accepted",
                     response_bytes=response_len,
-                    total_readings=len(all_readings),
-                    outbound_readings=len(all_outbound),
-                    inbound_readings=len(all_inbound),
-                    peak_outbound_mph=peak_outbound,
-                    peak_inbound_mph=peak_inbound,
-                    all_outbound_speeds=outbound_speeds,
-                    all_inbound_speeds=inbound_speeds,
-                    peak_outbound_magnitude=peak_out_mag,
-                    peak_inbound_magnitude=peak_in_mag,
                     trigger_latency_ms=trigger_latency,
                 )
 
@@ -728,6 +780,11 @@ class SoundTrigger(TriggerStrategy):
     instead, which uses Pi GPIO (lower threshold) + software S! trigger.
     """
 
+    CLOCK_SYNC_SAMPLES = 36
+    CLOCK_SYNC_MAX_ROLLOVER_UNCERTAINTY_MS = 40.0
+    CLOCK_SYNC_MAX_TIMEOUT_READ_MS = 50.0
+    CLOCK_SYNC_MAX_FALLBACK_AGE_S = 60.0
+
     def __init__(
         self,
         pre_trigger_segments: int = 12,
@@ -743,6 +800,207 @@ class SoundTrigger(TriggerStrategy):
                 The trigger does NOT configure rolling buffer mode itself.
         """
         super().__init__(pre_trigger_segments=pre_trigger_segments)
+
+    @staticmethod
+    def _clock_sync_last_read_host_time(clock_sync: dict) -> Optional[float]:
+        """Return the host time of the last C? read in a clock-sync summary."""
+        reads = clock_sync.get("reads") or []
+        if not reads or not isinstance(reads[-1], dict):
+            return None
+        return reads[-1].get("host_after") or reads[-1].get("host_mid")
+
+    @classmethod
+    def _clock_sync_age_s(cls, clock_sync: dict) -> Optional[float]:
+        """Return age in seconds for a clock-sync summary."""
+        last_host_time = cls._clock_sync_last_read_host_time(clock_sync)
+        if last_host_time is None:
+            return None
+        try:
+            return time.time() - float(last_host_time)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _clock_sync_quality(cls, clock_sync: object) -> tuple[bool, str]:
+        """Return whether a clock sync is trustworthy enough for shot timing."""
+        if not isinstance(clock_sync, dict):
+            return False, "missing"
+
+        if not clock_sync.get("usable_for_trigger_timestamps"):
+            return False, f"unusable_method:{clock_sync.get('clock_sync_method', 'unknown')}"
+
+        if clock_sync.get("best_offset_s") is None:
+            return False, "missing_best_offset"
+
+        reads = clock_sync.get("reads") or []
+        slow_invalid_reads = [
+            read
+            for read in reads
+            if isinstance(read, dict)
+            and read.get("radar_clock_s") is None
+            and (read.get("read_latency_ms") or 0.0) >= cls.CLOCK_SYNC_MAX_TIMEOUT_READ_MS
+        ]
+        if slow_invalid_reads:
+            return False, f"timeout_reads:{len(slow_invalid_reads)}"
+
+        method = clock_sync.get("clock_sync_method")
+        if method == "integer_rollover":
+            uncertainty = clock_sync.get("rollover_uncertainty_ms")
+            if uncertainty is None:
+                return False, "missing_rollover_uncertainty"
+            try:
+                if float(uncertainty) > cls.CLOCK_SYNC_MAX_ROLLOVER_UNCERTAINTY_MS:
+                    return False, f"rollover_uncertainty:{float(uncertainty):.1f}ms"
+            except (TypeError, ValueError):
+                return False, "invalid_rollover_uncertainty"
+            return True, "valid_integer_rollover"
+
+        if method == "fractional_clock":
+            return True, "valid_fractional_clock"
+
+        return False, f"unsupported_method:{method or 'unknown'}"
+
+    @classmethod
+    def _clock_sync_summary_for_log(cls, clock_sync: object) -> Optional[dict]:
+        """Return a compact JSONL-safe summary of a clock-sync candidate."""
+        if not isinstance(clock_sync, dict):
+            return None
+        valid, reason = cls._clock_sync_quality(clock_sync)
+        return {
+            "valid": valid,
+            "reason": reason,
+            "source": clock_sync.get("source"),
+            "samples": clock_sync.get("samples"),
+            "valid_samples": clock_sync.get("valid_samples"),
+            "clock_sync_method": clock_sync.get("clock_sync_method"),
+            "best_offset_s": clock_sync.get("best_offset_s"),
+            "raw_best_offset_s": clock_sync.get("raw_best_offset_s"),
+            "best_read_latency_ms": clock_sync.get("best_read_latency_ms"),
+            "offset_spread_ms": clock_sync.get("offset_spread_ms"),
+            "rollover_uncertainty_ms": clock_sync.get("rollover_uncertainty_ms"),
+            "age_s": (
+                round(cls._clock_sync_age_s(clock_sync), 3)
+                if cls._clock_sync_age_s(clock_sync) is not None
+                else None
+            ),
+        }
+
+    def _select_clock_sync_for_capture(
+        self,
+        radar: "OPS243Radar",
+        capture: IQCapture,
+    ) -> Optional[dict]:
+        """Choose and apply the best OPS clock sync for this capture."""
+        previous_sync = getattr(radar, "last_clock_sync", None)
+        previous_valid, previous_reason = self._clock_sync_quality(previous_sync)
+        previous_age_s = (
+            self._clock_sync_age_s(previous_sync) if isinstance(previous_sync, dict) else None
+        )
+
+        fresh_sync = None
+        fresh_error = None
+        if hasattr(radar, "read_clock_sync"):
+            try:
+                fresh_sync = radar.read_clock_sync(
+                    samples=self.CLOCK_SYNC_SAMPLES,
+                    store=False,
+                )
+                if isinstance(fresh_sync, dict):
+                    fresh_sync["source"] = "per_shot"
+            except Exception as exc:  # pylint: disable=broad-except
+                fresh_error = str(exc)
+                logger.warning("[TRIGGER] Per-shot OPS clock sync failed: %s", exc, exc_info=True)
+
+        fresh_valid, fresh_reason = self._clock_sync_quality(fresh_sync)
+
+        selected_sync = None
+        selected_source = "first_byte"
+        selected_reason = "no_valid_clock_sync"
+
+        if fresh_valid and isinstance(fresh_sync, dict):
+            selected_sync = fresh_sync
+            selected_source = "fresh"
+            selected_reason = fresh_reason
+            radar.last_clock_sync = fresh_sync
+        elif (
+            previous_valid
+            and isinstance(previous_sync, dict)
+            and previous_age_s is not None
+            and previous_age_s <= self.CLOCK_SYNC_MAX_FALLBACK_AGE_S
+        ):
+            selected_sync = previous_sync
+            selected_source = "previous"
+            selected_reason = (
+                f"fresh_rejected:{fresh_reason};previous_age:{previous_age_s:.1f}s"
+            )
+        elif previous_valid and previous_age_s is not None:
+            selected_reason = (
+                f"fresh_rejected:{fresh_reason};previous_too_old:{previous_age_s:.1f}s"
+            )
+        elif previous_reason != "missing":
+            selected_reason = f"fresh_rejected:{fresh_reason};previous_rejected:{previous_reason}"
+        elif fresh_error:
+            selected_reason = f"fresh_error:{fresh_error}"
+        else:
+            selected_reason = f"fresh_rejected:{fresh_reason}"
+
+        selected_offset_s = None
+        selected_age_s = None
+        if isinstance(selected_sync, dict):
+            selected_offset_s = selected_sync.get("best_offset_s")
+            selected_age_s = self._clock_sync_age_s(selected_sync)
+            try:
+                capture.apply_trigger_timestamp_from_clock_sync(float(selected_offset_s))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "[TRIGGER] Ignoring invalid selected OPS clock-sync offset: %r",
+                    selected_offset_s,
+                )
+                selected_sync = None
+                selected_source = "first_byte"
+                selected_reason = "selected_offset_invalid"
+                selected_offset_s = None
+
+        previous_offset_s = (
+            previous_sync.get("best_offset_s") if isinstance(previous_sync, dict) else None
+        )
+        fresh_offset_s = fresh_sync.get("best_offset_s") if isinstance(fresh_sync, dict) else None
+
+        selection_log = {
+            "selection": selected_source,
+            "selection_reason": selected_reason,
+            "selected_offset_s": selected_offset_s,
+            "selected_age_s": round(selected_age_s, 3) if selected_age_s is not None else None,
+            "fresh": self._clock_sync_summary_for_log(fresh_sync),
+            "previous": self._clock_sync_summary_for_log(previous_sync),
+            "fresh_error": fresh_error,
+            "fresh_delta_from_previous_ms": (
+                round((fresh_offset_s - previous_offset_s) * 1000.0, 3)
+                if fresh_offset_s is not None and previous_offset_s is not None
+                else None
+            ),
+        }
+
+        if selected_sync is not None:
+            logger.info(
+                "[TRIGGER] OPS clock sync selected: %s offset=%.6fs age=%sms "
+                "(fresh=%s, previous=%s, delta=%sms)",
+                selected_source,
+                selected_offset_s,
+                "n/a" if selected_age_s is None else f"{selected_age_s:.1f}",
+                fresh_reason,
+                previous_reason,
+                "n/a"
+                if selection_log["fresh_delta_from_previous_ms"] is None
+                else f"{selection_log['fresh_delta_from_previous_ms']:.1f}",
+            )
+        else:
+            logger.info(
+                "[TRIGGER] OPS clock sync fallback to first-byte timing: %s",
+                selected_reason,
+            )
+
+        return selection_log
 
     def wait_for_trigger(
         self,
@@ -761,10 +1019,7 @@ class SoundTrigger(TriggerStrategy):
         output, causing the radar to dump its rolling buffer automatically.
         We just block on serial read waiting for the I/Q data to arrive.
         """
-        logger.info(
-            "[TRIGGER] Waiting for sound trigger (timeout=%.0fs)...",
-            timeout
-        )
+        logger.info("[TRIGGER] Waiting for sound trigger (timeout=%.0fs)...", timeout)
 
         response = radar.wait_for_hardware_trigger(timeout=timeout)
 
@@ -774,11 +1029,19 @@ class SoundTrigger(TriggerStrategy):
 
         response_len = len(response)
         logger.info("[TRIGGER] Sound trigger fired, %d bytes received", response_len)
+        first_byte_timestamp = getattr(
+            radar,
+            "last_hardware_trigger_first_byte_timestamp",
+            None,
+        )
 
         # Re-arm for next capture
         radar.rearm_rolling_buffer(self.pre_trigger_segments)
 
-        capture = processor.parse_capture(response)
+        capture = processor.parse_capture(
+            response,
+            first_byte_timestamp=first_byte_timestamp,
+        )
 
         if not capture:
             logger.warning("[TRIGGER] Sound trigger parse failed (%d bytes received)", response_len)
@@ -789,61 +1052,56 @@ class SoundTrigger(TriggerStrategy):
             )
             return None
 
-        # Log raw I/Q for ALL triggers for offline analysis
-        self._log_capture(capture, accepted=False)
+        if first_byte_timestamp is not None and capture.first_byte_timestamp is None:
+            capture.first_byte_timestamp = float(first_byte_timestamp)
 
         # Quick validation: does the capture contain any real swing data?
         # At a driving range, a nearby player's impact sound can trip the
         # trigger even though nothing was moving in front of our radar.
         # Discard these false triggers immediately so we re-arm fast.
-        timeline = processor.process_standard(capture)
-        all_readings = timeline.readings
-        all_outbound = [r for r in all_readings if r.is_outbound]
-        all_inbound = [r for r in all_readings if not r.is_outbound]
-        outbound_speeds = [r.speed_mph for r in all_outbound]
-        inbound_speeds = [r.speed_mph for r in all_inbound]
-        peak_outbound = max(outbound_speeds, default=0)
-        peak_inbound = max(inbound_speeds, default=0)
-        peak_out_mag = max((r.magnitude for r in all_outbound), default=0)
-        peak_in_mag = max((r.magnitude for r in all_inbound), default=0)
+        summary = self._summarize_capture_activity(processor, capture)
 
-        outbound_valid = [r for r in all_outbound if r.speed_mph >= 15.0]
-
-        if not outbound_valid:
-            logger.info("[TRIGGER] Sound trigger rejected — no outbound speed >= 15 mph (peak=%.1f mph, %d readings)",
-                       peak_outbound, len(all_readings))
-            self._append_diagnostic(
+        if not summary["valid_outbound_count"]:
+            logger.info(
+                "[TRIGGER] Sound trigger rejected — no outbound speed >= %.0f mph "
+                "(peak=%.1f mph, %d readings)",
+                self.MIN_VALID_OUTBOUND_MPH,
+                summary["peak_outbound_mph"],
+                summary["total_readings"],
+            )
+            self._append_activity_diagnostic(
+                summary,
                 accepted=False,
                 reason="no_outbound_speed",
                 response_bytes=response_len,
-                total_readings=len(all_readings),
-                outbound_readings=len(all_outbound),
-                inbound_readings=len(all_inbound),
-                peak_outbound_mph=peak_outbound,
-                peak_inbound_mph=peak_inbound,
-                all_outbound_speeds=outbound_speeds,
-                all_inbound_speeds=inbound_speeds,
-                peak_outbound_magnitude=peak_out_mag,
-                peak_inbound_magnitude=peak_in_mag,
             )
             return None
 
-        peak = max(r.speed_mph for r in outbound_valid)
-        logger.info("[TRIGGER] Sound trigger accepted — peak %.1f mph, %d outbound readings",
-                   peak, len(outbound_valid))
-        self._append_diagnostic(
+        self._select_clock_sync_for_capture(radar, capture)
+
+        if capture.first_byte_timestamp is not None and capture.trigger_timestamp is None:
+            capture.apply_trigger_timestamp_from_first_byte()
+
+        if capture.trigger_timestamp is not None and capture.first_byte_timestamp is not None:
+            logger.info(
+                "[TRIGGER] Sound trigger wall time %.3f "
+                "(source=%s, first byte %.3f, post-trigger %.1fms)",
+                capture.trigger_timestamp,
+                capture.trigger_timestamp_source or "unknown",
+                capture.first_byte_timestamp,
+                capture.post_trigger_duration_ms,
+            )
+
+        logger.info(
+            "[TRIGGER] Sound trigger accepted — peak %.1f mph, %d outbound readings",
+            summary["valid_peak_outbound_mph"],
+            summary["valid_outbound_count"],
+        )
+        self._append_activity_diagnostic(
+            summary,
             accepted=True,
             reason="accepted",
             response_bytes=response_len,
-            total_readings=len(all_readings),
-            outbound_readings=len(all_outbound),
-            inbound_readings=len(all_inbound),
-            peak_outbound_mph=peak_outbound,
-            peak_inbound_mph=peak_inbound,
-            all_outbound_speeds=outbound_speeds,
-            all_inbound_speeds=inbound_speeds,
-            peak_outbound_magnitude=peak_out_mag,
-            peak_inbound_magnitude=peak_in_mag,
         )
 
         return capture
@@ -887,7 +1145,8 @@ def create_trigger(trigger_type: str = "speed", **kwargs) -> TriggerStrategy:
     }
 
     if trigger_type not in triggers:
-        raise ValueError(f"Unknown trigger type: {trigger_type}. "
-                        f"Available: {list(triggers.keys())}")
+        raise ValueError(
+            f"Unknown trigger type: {trigger_type}. Available: {list(triggers.keys())}"
+        )
 
     return triggers[trigger_type](**kwargs)

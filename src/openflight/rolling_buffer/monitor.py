@@ -14,7 +14,7 @@ from typing import Callable, List, Optional
 
 from ..launch_monitor import ClubType, Shot, estimate_carry_distance
 from ..ops243 import OPS243Radar, SpeedReading
-from ..session_logger import get_session_logger
+from ..session_logger import get_session_logger, log_session_error
 from .processor import RollingBufferProcessor
 from .trigger import create_trigger
 from .types import ProcessedCapture
@@ -22,7 +22,9 @@ from .types import ProcessedCapture
 logger = logging.getLogger("openflight.rolling_buffer.monitor")
 
 
-def get_optimal_spin_for_ball_speed(ball_speed_mph: float, club: ClubType = ClubType.DRIVER) -> float:
+def get_optimal_spin_for_ball_speed(
+    ball_speed_mph: float, club: ClubType = ClubType.DRIVER
+) -> float:
     """
     Get optimal spin rate for a given ball speed.
 
@@ -279,12 +281,16 @@ class RollingBufferMonitor:
         # Other triggers need rolling buffer mode configured upfront
         if self.trigger_type != "speed":
             # Get pre_trigger_segments from the trigger if available
-            pre_trigger_segments = getattr(self.trigger, 'pre_trigger_segments', 12)
+            pre_trigger_segments = getattr(self.trigger, "pre_trigger_segments", 12)
             self.radar.configure_for_rolling_buffer(
                 pre_trigger_segments=pre_trigger_segments,
                 sample_rate_ksps=self.sample_rate_ksps,
             )
-            logger.info("[MONITOR] Rolling buffer mode configured with S#%d, S=%d", pre_trigger_segments, self.sample_rate_ksps)
+            logger.info(
+                "[MONITOR] Rolling buffer mode configured with S#%d, S=%d",
+                pre_trigger_segments,
+                self.sample_rate_ksps,
+            )
         else:
             logger.info("[MONITOR] Using speed trigger — configuration deferred to trigger")
 
@@ -415,7 +421,15 @@ class RollingBufferMonitor:
 
                 # Process capture (FFT + speed/spin extraction)
                 process_start = time.time()
-                processed = self.processor.process_capture(capture)
+                processed = self.processor.process_capture(
+                    capture,
+                    expected_spin_for_ball_speed=lambda ball_speed_mph: (
+                        get_optimal_spin_for_ball_speed(
+                            ball_speed_mph,
+                            self._current_club,
+                        )
+                    ),
+                )
                 process_ms = (time.time() - process_start) * 1000
                 logger.info("[MONITOR] process_capture: %.1fms", process_ms)
 
@@ -450,16 +464,23 @@ class RollingBufferMonitor:
                     continue
 
                 # For speed trigger, use the trigger speed as club speed if not found in capture
-                if (self.trigger_type == "speed" and
-                    processed.club_speed_mph is None and
-                    hasattr(self.trigger, 'last_trigger_speed')):
+                if (
+                    self.trigger_type == "speed"
+                    and processed.club_speed_mph is None
+                    and hasattr(self.trigger, "last_trigger_speed")
+                ):
                     trigger_speed = self.trigger.last_trigger_speed
                     if trigger_speed > 0:
                         processed.club_speed_mph = trigger_speed
-                        logger.info("[MONITOR] Using trigger speed as club speed: %.1f mph", trigger_speed)
+                        logger.info(
+                            "[MONITOR] Using trigger speed as club speed: %.1f mph", trigger_speed
+                        )
 
-                logger.debug("[MONITOR] Processed: ball=%.1f mph, club=%s",
-                            processed.ball_speed_mph, processed.club_speed_mph)
+                logger.debug(
+                    "[MONITOR] Processed: ball=%.1f mph, club=%s",
+                    processed.ball_speed_mph,
+                    processed.club_speed_mph,
+                )
 
                 # Create shot
                 shot = self._create_shot(processed)
@@ -470,8 +491,17 @@ class RollingBufferMonitor:
                         "[MONITOR] Shot detected: ball=%.1f mph, club=%s, spin=%s",
                         shot.ball_speed_mph,
                         "%.1f" % shot.club_speed_mph if shot.club_speed_mph else "N/A",
-                        "%.0f" % shot.spin_rpm if shot.spin_rpm else "N/A"
+                        "%.0f" % shot.spin_rpm if shot.spin_rpm else "N/A",
                     )
+                    if shot.spin_rejection_reason:
+                        logger.info(
+                            "[MONITOR] Spin unavailable: %s (snr=%s, candidate=%s rpm)",
+                            shot.spin_rejection_reason,
+                            "%.2f" % shot.spin_snr if shot.spin_snr is not None else "N/A",
+                            "%.0f" % (shot.spin_peak_freq_hz * 60)
+                            if shot.spin_peak_freq_hz is not None
+                            else "N/A",
+                        )
 
                     # Log raw I/Q data and trigger events to session logger
                     session_logger = get_session_logger()
@@ -489,36 +519,85 @@ class RollingBufferMonitor:
                             club_speed_mph=shot.club_speed_mph,
                             ball_timestamp_ms=processed.ball_timestamp_ms,
                             club_timestamp_ms=processed.club_timestamp_ms,
+                            impact_timestamp_ms=processed.impact_timestamp_ms,
+                            impact_source=processed.impact_source,
+                            impact_reason=(processed.impact.reason if processed.impact else None),
+                            impact_speed_delta_mph=(
+                                processed.impact.speed_delta_mph if processed.impact else None
+                            ),
+                            impact_transition_gap_ms=(
+                                processed.impact.transition_gap_ms if processed.impact else None
+                            ),
+                            impact_last_club_speed_mph=(
+                                processed.impact.last_club_speed_mph if processed.impact else None
+                            ),
+                            impact_last_club_timestamp_ms=(
+                                processed.impact.last_club_timestamp_ms
+                                if processed.impact
+                                else None
+                            ),
+                            impact_last_club_center_ms=(
+                                processed.impact.last_club_center_ms if processed.impact else None
+                            ),
+                            impact_first_ball_speed_mph=(
+                                processed.impact.first_ball_speed_mph if processed.impact else None
+                            ),
+                            impact_first_ball_timestamp_ms=(
+                                processed.impact.first_ball_timestamp_ms
+                                if processed.impact
+                                else None
+                            ),
+                            impact_first_ball_center_ms=(
+                                processed.impact.first_ball_center_ms if processed.impact else None
+                            ),
+                            impact_min_transition_delta_mph=(
+                                processed.impact.min_transition_delta_mph
+                                if processed.impact
+                                else None
+                            ),
                             trigger_latency_ms=trigger_latency_ms,
+                            first_byte_timestamp=capture.first_byte_timestamp,
+                            trigger_timestamp=capture.trigger_timestamp,
+                            trigger_timestamp_source=capture.trigger_timestamp_source,
+                            clock_sync_offset_s=capture.clock_sync_offset_s,
+                            post_trigger_duration_ms=capture.post_trigger_duration_ms,
                             smash_factor=processed.smash_factor,
                             spin_rpm=processed.spin.spin_rpm if processed.spin else None,
                             spin_confidence=processed.spin.confidence if processed.spin else None,
                             spin_quality=processed.spin.quality if processed.spin else None,
                             spin_snr=processed.spin.snr if processed.spin else None,
                             spin_modulation_depth=(
-                                processed.spin.modulation_depth
-                                if processed.spin else None
+                                processed.spin.modulation_depth if processed.spin else None
                             ),
                             spin_peak_freq_hz=(
-                                processed.spin.peak_freq_hz
-                                if processed.spin else None
+                                processed.spin.peak_freq_hz if processed.spin else None
                             ),
                             spin_seam_cycles=(
-                                processed.spin.seam_cycles
-                                if processed.spin else None
+                                processed.spin.seam_cycles if processed.spin else None
                             ),
                             spin_at_lower_rail=(
-                                processed.spin.at_lower_rail
-                                if processed.spin else None
+                                processed.spin.at_lower_rail if processed.spin else None
                             ),
                             spin_at_upper_rail=(
-                                processed.spin.at_upper_rail
-                                if processed.spin else None
+                                processed.spin.at_upper_rail if processed.spin else None
                             ),
-                            spin_rejection_reason=(
-                                processed.spin.rejection_reason
-                                if processed.spin else None
+                            spin_candidates=(
+                                [candidate.to_dict() for candidate in processed.spin.candidates]
+                                if processed.spin
+                                else None
                             ),
+                            spin_phase_method=(
+                                processed.spin.phase_method if processed.spin else None
+                            ),
+                            spin_phase_rpm=(processed.spin.phase_rpm if processed.spin else None),
+                            spin_phase_snr=(processed.spin.phase_snr if processed.spin else None),
+                            spin_phase_agreement_pct=(
+                                processed.spin.phase_agreement_pct if processed.spin else None
+                            ),
+                            spin_phase_confirmed=(
+                                processed.spin.phase_confirmed if processed.spin else False
+                            ),
+                            spin_rejection_reason=shot.spin_rejection_reason,
                         )
 
                         # Log accepted trigger event
@@ -553,25 +632,40 @@ class RollingBufferMonitor:
 
                     # Emit diagnostic to UI
                     if self._diagnostic_callback:
-                        self._diagnostic_callback({
-                            "timestamp": datetime.now().isoformat(),
-                            "accepted": True,
-                            "reason": "accepted",
-                            "trigger_type": self.trigger_type,
-                            "latency_ms": trigger_latency_ms,
-                            "response_bytes": 0,
-                            "total_readings": len(processed.timeline.readings),
-                            "outbound_readings": 0,
-                            "inbound_readings": 0,
-                            "peak_outbound_mph": shot.ball_speed_mph,
-                            "peak_inbound_mph": 0,
-                            "all_outbound_speeds": [],
-                            "all_inbound_speeds": [],
-                            "ball_speed_mph": shot.ball_speed_mph,
-                            "club_speed_mph": shot.club_speed_mph,
-                            "spin_rpm": shot.spin_rpm,
-                            "carry_yards": shot.estimated_carry_yards,
-                        })
+                        self._diagnostic_callback(
+                            {
+                                "timestamp": datetime.now().isoformat(),
+                                "accepted": True,
+                                "reason": "accepted",
+                                "trigger_type": self.trigger_type,
+                                "latency_ms": trigger_latency_ms,
+                                "response_bytes": 0,
+                                "total_readings": len(processed.timeline.readings),
+                                "outbound_readings": 0,
+                                "inbound_readings": 0,
+                                "peak_outbound_mph": shot.ball_speed_mph,
+                                "peak_inbound_mph": 0,
+                                "all_outbound_speeds": [],
+                                "all_inbound_speeds": [],
+                                "ball_speed_mph": shot.ball_speed_mph,
+                                "club_speed_mph": shot.club_speed_mph,
+                                "spin_rpm": shot.spin_rpm,
+                                "spin_snr": shot.spin_snr,
+                                "spin_candidate_rpm": (
+                                    round(shot.spin_peak_freq_hz * 60)
+                                    if shot.spin_peak_freq_hz is not None
+                                    else None
+                                ),
+                                "spin_rejection_reason": shot.spin_rejection_reason,
+                                "spin_candidates": shot.spin_candidates,
+                                "spin_phase_method": shot.spin_phase_method,
+                                "spin_phase_rpm": shot.spin_phase_rpm,
+                                "spin_phase_snr": shot.spin_phase_snr,
+                                "spin_phase_agreement_pct": shot.spin_phase_agreement_pct,
+                                "spin_phase_confirmed": shot.spin_phase_confirmed,
+                                "carry_yards": shot.estimated_carry_yards,
+                            }
+                        )
 
                     if self._shot_callback:
                         callback_start = time.time()
@@ -584,13 +678,18 @@ class RollingBufferMonitor:
                             len(self._shots),
                             shot.ball_speed_mph,
                             "%.1f" % shot.club_speed_mph if shot.club_speed_mph else "N/A",
-                            "%.0f" % shot.estimated_carry_yards if shot.estimated_carry_yards else "N/A",
-                            trigger_latency_ms, process_ms, callback_ms, total_ms,
+                            "%.0f" % shot.estimated_carry_yards
+                            if shot.estimated_carry_yards
+                            else "N/A",
+                            trigger_latency_ms,
+                            process_ms,
+                            callback_ms,
+                            total_ms,
                         )
                 else:
                     logger.info(
                         "[MONITOR] Shot validation failed: ball=%.1f mph (min 15 mph)",
-                        processed.ball_speed_mph if processed else 0
+                        processed.ball_speed_mph if processed else 0,
                     )
                     # Emit diagnostic for shot validation failure
                     diag = {
@@ -628,6 +727,12 @@ class RollingBufferMonitor:
 
             except Exception as e:
                 logger.error("[MONITOR] Capture loop error: %s", e, exc_info=True)
+                log_session_error(
+                    "Rolling buffer capture loop error",
+                    component="rolling_buffer_monitor",
+                    context={"trigger_type": self.trigger_type},
+                    exc=e,
+                )
                 time.sleep(1.0)
 
     def _create_shot(self, processed: ProcessedCapture) -> Optional[Shot]:
@@ -645,41 +750,169 @@ class RollingBufferMonitor:
             logger.debug("[MONITOR] Ball speed too low: %.1f mph", processed.ball_speed_mph)
             return None
 
-        # Calculate carry distance
-        # Use spin-adjusted carry only for reliable spin readings
-        has_reliable_spin = processed.has_spin and processed.spin
-        has_any_spin = processed.spin is not None and processed.spin.spin_rpm > 0
+        spin = processed.spin
+        spin_rejection_reason = spin.rejection_reason if spin else None
+        club_spin_rejection_reason = self._club_spin_rejection_reason(processed)
+        if club_spin_rejection_reason:
+            spin_rejection_reason = club_spin_rejection_reason
+            logger.warning(
+                "[MONITOR] Spin rejected by club plausibility: %s "
+                "(club=%s, ball=%.1f mph, candidate=%s rpm)",
+                club_spin_rejection_reason,
+                self._current_club.value,
+                processed.ball_speed_mph,
+                "%.0f" % spin.spin_rpm if spin else "N/A",
+            )
+
+        # Calculate carry distance.
+        # Use spin-adjusted carry only for reliable, plausible spin readings.
+        has_reliable_spin = bool(
+            processed.has_spin
+            and club_spin_rejection_reason is None
+            and spin is not None
+            and not spin.at_lower_rail
+            and not spin.at_upper_rail
+        )
+        has_reportable_spin = bool(
+            spin is not None
+            and spin.spin_rpm > 0
+            and club_spin_rejection_reason is None
+            and not spin.at_lower_rail
+            and not spin.at_upper_rail
+        )
+        if (
+            spin is not None
+            and spin.spin_rpm > 0
+            and club_spin_rejection_reason is None
+            and not has_reportable_spin
+        ):
+            if spin.at_lower_rail:
+                spin_rejection_reason = (
+                    f"Lower-rail spin candidate {spin.spin_rpm:.0f} RPM kept as diagnostic only"
+                )
+            elif spin.at_upper_rail:
+                spin_rejection_reason = (
+                    f"Upper-rail spin candidate {spin.spin_rpm:.0f} RPM kept as diagnostic only"
+                )
 
         if has_reliable_spin:
             carry = estimate_carry_with_spin(
                 processed.ball_speed_mph,
-                processed.spin.spin_rpm,
+                spin.spin_rpm,
                 self._current_club,
                 club_speed_mph=processed.club_speed_mph,
             )
         else:
             carry = estimate_carry_distance(processed.ball_speed_mph, self._current_club)
 
-        # Always pass spin data through if detected (even low quality)
-        # The UI shows confidence indicators so the user can judge
-        spin_rpm = processed.spin.spin_rpm if has_any_spin else None
-        spin_confidence = processed.spin.confidence if has_any_spin else None
+        spin_rpm = spin.spin_rpm if has_reportable_spin else None
+        spin_confidence = spin.confidence if has_reportable_spin else None
+        spin_result_quality = spin.quality if has_reportable_spin else None
+        capture = processed.capture
+        impact_timestamp = None
+        impact_timestamp_kld7: Optional[float] = None
+        if capture is not None:
+            trigger_epoch = (
+                capture.trigger_timestamp
+                if capture.trigger_timestamp is not None
+                else capture.first_byte_timestamp
+            )
+            impact_timestamp = trigger_epoch
+
+            impact_timestamp_kld7 = self._impact_epoch_from_processed(processed)
+            if impact_timestamp_kld7 is None:
+                impact_timestamp_kld7 = trigger_epoch
 
         # Create shot with extended fields
         shot = Shot(
             ball_speed_mph=processed.ball_speed_mph,
             timestamp=datetime.now(),
+            impact_timestamp=impact_timestamp,
+            impact_timestamp_kld7=impact_timestamp_kld7,
             club_speed_mph=processed.club_speed_mph,
             peak_magnitude=None,  # Not directly available in rolling buffer mode
             readings=[],  # Raw readings not stored (use ProcessedCapture instead)
             club=self._current_club,
             spin_rpm=spin_rpm,
             spin_confidence=spin_confidence,
+            spin_result_quality=spin_result_quality,
+            spin_snr=spin.snr if spin else None,
+            spin_modulation_depth=spin.modulation_depth if spin else None,
+            spin_peak_freq_hz=spin.peak_freq_hz if spin else None,
+            spin_seam_cycles=spin.seam_cycles if spin else None,
+            spin_at_lower_rail=spin.at_lower_rail if spin else None,
+            spin_at_upper_rail=spin.at_upper_rail if spin else None,
+            spin_candidates=(
+                [candidate.to_dict() for candidate in spin.candidates] if spin else None
+            ),
+            spin_phase_method=spin.phase_method if spin else None,
+            spin_phase_rpm=spin.phase_rpm if spin else None,
+            spin_phase_snr=spin.phase_snr if spin else None,
+            spin_phase_agreement_pct=spin.phase_agreement_pct if spin else None,
+            spin_phase_confirmed=spin.phase_confirmed if spin else False,
+            spin_rejection_reason=spin_rejection_reason,
             carry_spin_adjusted=carry if has_reliable_spin else None,
             mode="rolling-buffer",
         )
 
         return shot
+
+    @staticmethod
+    def _impact_epoch_from_processed(processed: ProcessedCapture) -> Optional[float]:
+        """Convert the capture-relative impact estimate into host epoch time."""
+        capture = processed.capture
+        if capture is None or capture.trigger_timestamp is None:
+            return None
+
+        if processed.impact_timestamp_ms is None:
+            return capture.trigger_timestamp
+
+        impact_delta_ms = processed.impact_timestamp_ms - capture.trigger_offset_ms
+        return capture.trigger_timestamp + impact_delta_ms / 1000.0
+
+    def _club_spin_rejection_reason(
+        self,
+        processed: ProcessedCapture,
+    ) -> Optional[str]:
+        """Reject lower-rail spin candidates that are implausible for the
+        selected club.
+
+        The OPS envelope FFT can lock onto the low edge of the search band
+        around 3300-3500 RPM. That can be real for a driver, but in real
+        Trackman comparison sessions the same rail value showed up as false
+        spin for 7-irons and wedges. Keep the raw DSP diagnostics, but do
+        not expose those rail picks as measured spin for high-spin clubs.
+        """
+        spin = processed.spin
+        if not spin or spin.spin_rpm <= 0 or not spin.at_lower_rail:
+            return None
+
+        high_spin_clubs = {
+            ClubType.IRON_6,
+            ClubType.IRON_7,
+            ClubType.IRON_8,
+            ClubType.IRON_9,
+            ClubType.PW,
+            ClubType.GW,
+            ClubType.SW,
+            ClubType.LW,
+        }
+        if self._current_club not in high_spin_clubs:
+            return None
+
+        optimal_spin = get_optimal_spin_for_ball_speed(
+            processed.ball_speed_mph,
+            self._current_club,
+        )
+        floor_rpm = optimal_spin * 0.60
+        if spin.spin_rpm >= floor_rpm:
+            return None
+
+        return (
+            f"Lower-rail spin candidate {spin.spin_rpm:.0f} RPM is below "
+            f"the {self._current_club.value} plausibility floor "
+            f"({floor_rpm:.0f} RPM)"
+        )
 
     def wait_for_shot(self, timeout: float = 60) -> Optional[Shot]:
         """
@@ -732,11 +965,7 @@ class RollingBufferMonitor:
         smash_factors = [s.smash_factor for s in self._shots if s.smash_factor]
 
         # Get spin data
-        spin_rpms = [
-            s.spin_rpm
-            for s in self._shots
-            if s.spin_rpm is not None
-        ]
+        spin_rpms = [s.spin_rpm for s in self._shots if s.spin_rpm is not None]
 
         return {
             "shot_count": len(self._shots),

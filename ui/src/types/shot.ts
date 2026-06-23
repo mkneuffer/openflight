@@ -19,6 +19,7 @@ export interface Shot {
   spin_rpm: number | null;
   spin_confidence: number | null;
   spin_quality: 'high' | 'medium' | 'low' | null;
+  spin_source: 'measured' | 'calculated' | null;
   carry_spin_adjusted: number | null;
 }
 

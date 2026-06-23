@@ -48,6 +48,15 @@ credentials.env
 *.env
 !*.env.example
 
+# Local capture and analysis artifacts. Historical fixtures under
+# session_logs remain tracked; new logs can still be added with git add -f.
+session_logs/session_*.jsonl
+session_logs/*.csv
+session_logs/*.md
+session_logs/*.pkl
+session_logs/*.zip
+session_logs/*/
+
 # Test artifacts
 test_camera.jpg
 .pytest_cache/
@@ -60,3 +69,8 @@ htmlcov/
 # UI (Node.js)
 ui/node_modules/
 ui/dist/autoresearch-results.tsv
+
+# Simulator connector config (copy from config/sim.example.json)
+config/sim.json
+ui/playwright-report/
+ui/test-results/

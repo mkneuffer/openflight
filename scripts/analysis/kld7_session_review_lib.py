@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from collections import defaultdict
 from dataclasses import dataclass
@@ -9,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from openflight.kld7.radc import RADC_PAYLOAD_BYTES
 
 DISTANCE_MIN_M = 0.6
 DISTANCE_MAX_M = 5.2
@@ -105,7 +108,12 @@ def _coerce_float(value: Any, description: str) -> float:
         raise ValueError(f"{description} must be numeric, got {value!r}") from error
 
 
-def _validate_frames(shot_number: int, buffer_entry: dict[str, Any]) -> list[dict[str, Any]]:
+def _validate_frames(
+    shot_number: int,
+    buffer_entry: dict[str, Any],
+    *,
+    require_radc_payload_size: bool = False,
+) -> list[dict[str, Any]]:
     frames = buffer_entry.get("frames")
     if not isinstance(frames, list) or not frames:
         raise ValueError(f"shot {shot_number} is missing a usable kld7_buffer.frames list")
@@ -147,7 +155,27 @@ def _validate_frames(shot_number: int, buffer_entry: dict[str, Any]) -> list[dic
                         )
                 hits.append(hit)
 
-        normalized_frames.append({"timestamp": timestamp, "pdat": hits})
+        normalized_frame: dict[str, Any] = {"timestamp": timestamp, "pdat": hits}
+        radc_b64 = frame.get("radc_b64")
+        if radc_b64 is not None:
+            if not isinstance(radc_b64, str):
+                raise ValueError(
+                    f"shot {shot_number} frame {frame_index} has non-string radc_b64 data"
+                )
+            try:
+                radc = base64.b64decode(radc_b64, validate=True)
+            except ValueError as error:
+                raise ValueError(
+                    f"shot {shot_number} frame {frame_index} has invalid radc_b64 data"
+                ) from error
+            if require_radc_payload_size and len(radc) != RADC_PAYLOAD_BYTES:
+                raise ValueError(
+                    f"shot {shot_number} frame {frame_index} has invalid radc_b64 payload "
+                    f"size: expected {RADC_PAYLOAD_BYTES} bytes, got {len(radc)}"
+                )
+            normalized_frame["radc"] = radc
+
+        normalized_frames.append(normalized_frame)
 
     return normalized_frames
 

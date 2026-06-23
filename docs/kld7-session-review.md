@@ -8,7 +8,7 @@ It is intentionally an **offline empirical review tool**, not a live detector.
 
 For each shot in a session log, the review script:
 
-1. parses `rolling_buffer_capture`, `kld7_buffer`, and `shot_detected` rows by `shot_number`
+1. parses `rolling_buffer_capture`, `kld7_buffer`, `shot_detected`, and `error` rows by `shot_number` or timestamp
 2. re-detects likely club-impact anchors directly from the raw K-LD7 frame buffer
 3. scores outward post-impact `pdat` paths by:
    - timing after impact
@@ -102,6 +102,38 @@ Treat a shot as weak evidence when it:
 - stays almost flat in distance
 - shows only one noisy frame
 - leaves obvious lingering returns after the burst
+
+## Session `error` entries
+
+OpenFlight writes `type: "error"` lines to the same JSONL session file when shot
+processing, K-LD7 streaming, rolling-buffer capture, or radar config updates fail.
+These are separate from Python stderr logs and are useful when reviewing a session
+offline.
+
+Typical fields:
+
+| Field | Meaning |
+|-------|---------|
+| `error` | Short description (e.g. `K-LD7 shot processing failed`) |
+| `context.component` | Subsystem (`server`, `kld7_tracker`, `rolling_buffer_monitor`, …) |
+| `context.stage` | Step within the pipeline (`kld7`, `set_radar_config`, …) |
+| `context.exception_type` | Exception class when one was caught |
+| `context.exception_message` | `str(exception)` |
+
+Quick filter while inspecting a session:
+
+```bash
+grep '"type": "error"' session_logs/session_*.jsonl
+```
+
+In Grafana/Loki (see [observability.md](observability.md)):
+
+```logql
+{app="openflight", log_type="error"}
+```
+
+A burst of `error` rows around a shot often explains missing `kld7_buffer` or
+launch-angle gaps in the review plots.
 
 ## Limits
 

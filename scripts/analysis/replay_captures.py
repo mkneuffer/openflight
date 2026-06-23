@@ -115,21 +115,21 @@ def analyze_block_detail(processor: RollingBufferProcessor, i_block, q_block, bl
     print(f"  Block {block_idx:3d} (t={timestamp_ms:6.1f}ms):")
 
     if pos_peaks:
-        print(f"    OUTBOUND (pos freq) top peaks:")
+        print("    OUTBOUND (pos freq) top peaks:")
         for bin_idx, mag, speed, masked in pos_peaks:
             mask_tag = " [DC MASKED]" if masked else ""
             thresh_tag = " [< threshold]" if mag < processor.MAGNITUDE_THRESHOLD else ""
             print(f"      bin {bin_idx:5d}  mag {mag:8.1f}  {speed:6.1f} mph{mask_tag}{thresh_tag}")
     else:
-        print(f"    OUTBOUND: no peaks above 1.0")
+        print("    OUTBOUND: no peaks above 1.0")
 
     if neg_peaks:
-        print(f"    INBOUND (neg freq) top peaks:")
+        print("    INBOUND (neg freq) top peaks:")
         for bin_idx, mag, speed, masked in neg_peaks:
             thresh_tag = " [< threshold]" if mag < processor.MAGNITUDE_THRESHOLD else ""
             print(f"      bin {bin_idx:5d}  mag {mag:8.1f}  {speed:6.1f} mph{thresh_tag}")
     else:
-        print(f"    INBOUND: no peaks above 1.0")
+        print("    INBOUND: no peaks above 1.0")
 
     if dc_neg_peak_mag > 1.0:
         freq_bin = processor.FFT_SIZE - dc_neg_peak_bin
@@ -171,7 +171,7 @@ def analyze_capture(
     )
 
     # Standard processing (what the trigger uses for validation)
-    print(f"\n--- Standard Processing (128-sample blocks, no overlap) ---")
+    print("\n--- Standard Processing (128-sample blocks, no overlap) ---")
     timeline_std = processor.process_standard(capture)
     outbound = [r for r in timeline_std.readings if r.is_outbound]
     inbound = [r for r in timeline_std.readings if not r.is_outbound]
@@ -197,7 +197,7 @@ def analyze_capture(
         print(f"  Inbound speed values: {', '.join(speeds)}")
 
     # Overlapping processing (what the main pipeline uses)
-    print(f"\n--- Overlapping Processing (32-sample steps) ---")
+    print("\n--- Overlapping Processing (32-sample steps) ---")
     timeline_ovr = processor.process_overlapping(capture)
     outbound_ovr = [r for r in timeline_ovr.readings if r.is_outbound]
     inbound_ovr = [r for r in timeline_ovr.readings if not r.is_outbound]
@@ -213,7 +213,7 @@ def analyze_capture(
         print(f"  Outbound >= 15 mph: {len(above_15)}")
 
     # Full pipeline
-    print(f"\n--- Full Pipeline (process_capture) ---")
+    print("\n--- Full Pipeline (process_capture) ---")
     result = processor.process_capture(capture)
     if result:
         print(f"  Ball speed: {result.ball_speed_mph:.1f} mph")
@@ -222,15 +222,30 @@ def analyze_capture(
         if result.spin:
             print(f"    spin_rpm={result.spin.spin_rpm:.0f}  snr={result.spin.snr:.1f}  "
                   f"quality={result.spin.quality}  confidence={result.spin.confidence:.2f}")
+            if result.spin.candidates:
+                print("    top candidates:")
+                for candidate in result.spin.candidates[:5]:
+                    rail = ""
+                    if candidate.at_lower_rail:
+                        rail = " lower-rail"
+                    elif candidate.at_upper_rail:
+                        rail = " upper-rail"
+                    selected = " *" if candidate.selected else ""
+                    print(
+                        f"      #{candidate.rank}: {candidate.rpm:.0f} rpm"
+                        f"  snr={candidate.snr:.1f}"
+                        f"  rel={candidate.relative_magnitude:.2f}"
+                        f"{rail}{selected}"
+                    )
         # Count ball speed samples used for spin analysis
         ball_samples = [r for r in timeline_ovr.readings if r.is_outbound and r.speed_mph >= 15.0]
         print(f"  Ball speed samples for spin analysis: {len(ball_samples)}")
     else:
-        print(f"  RESULT: None (no valid shot detected)")
+        print("  RESULT: None (no valid shot detected)")
 
     # Detailed per-block FFT analysis
     if fft_detail:
-        print(f"\n--- Per-Block FFT Detail ---")
+        print("\n--- Per-Block FFT Detail ---")
         print(f"  DC_MASK_BINS={processor.DC_MASK_BINS} (~{processor.DC_MASK_BINS * processor.SAMPLE_RATE / processor.FFT_SIZE * processor.WAVELENGTH_M / 2 * processor.MPS_TO_MPH:.1f} mph)")
         print(f"  MAGNITUDE_THRESHOLD={processor.MAGNITUDE_THRESHOLD}")
 
@@ -261,8 +276,8 @@ def main():
 
     if not captures:
         print(f"No rolling_buffer_capture entries found in {args.session_file}")
-        print(f"\nThis session may not have I/Q logging enabled.")
-        print(f"Deploy the latest code and re-test to capture raw I/Q data.")
+        print("\nThis session may not have I/Q logging enabled.")
+        print("Deploy the latest code and re-test to capture raw I/Q data.")
         sys.exit(1)
 
     print(f"Found {len(captures)} captures in {args.session_file}")
@@ -306,9 +321,15 @@ def main():
             spin = f"{result.spin.spin_rpm:.0f}" if result and result.spin and result.spin.spin_rpm > 0 else "-"
             spin_snr = f"{result.spin.snr:.1f}" if result and result.spin and result.spin.snr > 0 else "-"
             spin_q = result.spin.quality[:3] if result and result.spin and result.spin.spin_rpm > 0 else "-"
+            top = "-"
+            if result and result.spin and result.spin.candidates:
+                top = "/".join(
+                    str(round(candidate.rpm))
+                    for candidate in result.spin.candidates[:3]
+                )
             print(f"  #{idx:3d}: out={len(outbound):3d} (>15mph: {out_above_15:3d}, "
                   f"peak {peak_out:5.1f})  in={len(inbound):3d} (peak {peak_in:5.1f})  "
-                  f"ball={ball} mph  spin={spin} snr={spin_snr} q={spin_q}")
+                  f"ball={ball} mph  spin={spin} snr={spin_snr} q={spin_q} top={top}")
         else:
             analyze_capture(processor, capture_data, idx, fft_detail=args.fft_detail)
 

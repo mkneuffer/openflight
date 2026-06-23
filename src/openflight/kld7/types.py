@@ -1,7 +1,7 @@
 """Data types for K-LD7 angle radar integration."""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -15,6 +15,9 @@ class KLD7Frame:
 
     timestamp: float
     radc: Optional[bytes] = None  # raw 3072-byte ADC payload
+    arrival_timestamp: Optional[float] = None
+    complete_timestamp: Optional[float] = None
+    read_duration_ms: Optional[float] = None
 
 
 @dataclass
@@ -29,3 +32,7 @@ class KLD7Angle:
     num_frames: int = 0
     # "ball", "club", or None (unclassified / horizontal orientation)
     detection_class: Optional[str] = None
+    frames_examined: int = 0
+    frames_available: int = 0
+    frames_ignored_stale: int = 0
+    radc_selection: Optional[dict[str, Any]] = None

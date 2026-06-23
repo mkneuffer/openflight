@@ -25,14 +25,16 @@ Speed limits by sample rate:
 
 import json
 import logging
-import threading
+import re
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 import serial
 import serial.tools.list_ports
+
+from .serial_latency import log_usb_serial_latency_timer
 
 # Configure logging for raw radar data
 logger = logging.getLogger("ops243")
@@ -48,18 +50,40 @@ def set_show_raw_readings(enabled: bool):
     _show_raw_readings = enabled
 
 
+_CLOCK_RE = re.compile(r'"?Clock"?\s*:\s*"?(-?\d+(?:\.\d+)?)"?')
+
+
+def _parse_ops_clock(response: str) -> Optional[float]:
+    """Pull the numeric clock value (seconds since power-on) from a C? reply.
+
+    The OPS243 answers C? with e.g. ``{"Clock":"137.429"}``. Clock resolution
+    varies by firmware (some report whole seconds), so the caller keeps the raw
+    reply; here we only extract the value. Returns None when no value is found.
+    """
+    if not response:
+        return None
+    match = _CLOCK_RE.search(response)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
 class SpeedUnit(Enum):
     """Speed units supported by OPS243-A."""
-    MPS = "UM"      # meters per second (default)
-    MPH = "US"      # miles per hour
-    KPH = "UK"      # kilometers per hour
-    FPS = "UF"      # feet per second
-    CMS = "UC"      # centimeters per second
 
+    MPS = "UM"  # meters per second (default)
+    MPH = "US"  # miles per hour
+    KPH = "UK"  # kilometers per hour
+    FPS = "UF"  # feet per second
+    CMS = "UC"  # centimeters per second
 
 
 class Direction(Enum):
     """Direction of detected object."""
+
     INBOUND = "inbound"
     OUTBOUND = "outbound"
     UNKNOWN = "unknown"
@@ -68,26 +92,12 @@ class Direction(Enum):
 @dataclass
 class SpeedReading:
     """A single speed reading from the radar."""
+
     speed: float
     direction: Direction
     magnitude: Optional[float] = None
     timestamp: Optional[float] = None
     unit: str = "mph"
-
-
-@dataclass
-class IQBlock:
-    """
-    A block of raw I/Q samples from the radar.
-
-    Each block contains 128 samples at 30ksps (~4.3ms of data).
-    Blocks arrive every ~31ms due to serial bandwidth limits.
-    Used for continuous I/Q streaming mode where we process
-    the FFT locally instead of using the radar's internal processing.
-    """
-    i_samples: List[int]  # Raw I channel ADC values (0-4095)
-    q_samples: List[int]  # Raw Q channel ADC values (0-4095)
-    timestamp: float      # When this block was received
 
 
 class OPS243Radar:
@@ -126,13 +136,12 @@ class OPS243Radar:
         self.port = port
         self.baud = baud
         self.serial: Optional[serial.Serial] = None
-        self._streaming = False
-        self._stream_thread: Optional[threading.Thread] = None
-        self._iq_callback: Optional[Callable[[IQBlock], None]] = None
-        self._iq_error_callback: Optional[Callable[[str], None]] = None
         self._unit = "mph"
         self._json_mode = False
         self._magnitude_enabled = False
+        self.last_hardware_trigger_first_byte_timestamp: Optional[float] = None
+        # Most recent OPS-clock -> host-epoch sync (see read_clock_sync).
+        self.last_clock_sync: Optional[dict] = None
 
     @staticmethod
     def find_radar_ports() -> List[str]:
@@ -177,8 +186,9 @@ class OPS243Radar:
                 timeout=timeout,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE
+                stopbits=serial.STOPBITS_ONE,
             )
+            log_usb_serial_latency_timer(logger, "OPS", self.port)
             # Drain any in-progress dump (e.g. radar triggered while no software was running).
             # Opening the port unblocks the radar's UART TX, so we read until silence.
             self._drain_serial()
@@ -188,7 +198,6 @@ class OPS243Radar:
 
     def disconnect(self):
         """Disconnect from the radar sensor."""
-        self.stop_streaming()
         if self.serial and self.serial.is_open:
             self.serial.close()
             self.serial = None
@@ -239,12 +248,12 @@ class OPS243Radar:
         self.serial.reset_input_buffer()
 
         # Send command
-        self.serial.write(cmd.encode('ascii'))
+        self.serial.write(cmd.encode("ascii"))
 
         # For commands that require carriage return
         # Note: S# commands (trigger split) also need \r
-        if '=' in cmd or '>' in cmd or '<' in cmd or '#' in cmd:
-            self.serial.write(b'\r')
+        if "=" in cmd or ">" in cmd or "<" in cmd or "#" in cmd:
+            self.serial.write(b"\r")
 
         # Wait for response
         time.sleep(0.1)
@@ -252,10 +261,187 @@ class OPS243Radar:
         # Read response
         response = ""
         while self.serial.in_waiting:
-            response += self.serial.read(self.serial.in_waiting).decode('ascii', errors='ignore')
+            response += self.serial.read(self.serial.in_waiting).decode("ascii", errors="ignore")
             time.sleep(0.05)
 
         return response.strip()
+
+    def read_clock_sync(
+        self,
+        samples: int = 7,
+        per_read_timeout: float = 0.2,
+        max_sync_duration_s: float = 1.25,
+        sample_interval_s: float = 0.01,
+        store: bool = True,
+    ) -> dict:
+        """Map the OPS internal clock to host epoch via repeated ``C?`` reads.
+
+        The radar stamps its rolling-buffer trigger on an internal clock
+        (``trigger_time``, fractional seconds) that is *immune to USB read
+        latency*. To convert that to a host epoch later we need the offset
+        ``O = host_epoch - radar_clock``.
+
+        Each read is bracketed by ``time.time()`` before and after a *tight*
+        poll for the reply (not the fixed-0.1s ``_send_command`` path), so the
+        radar sampled its clock somewhere inside that bracket. ``offset_s`` is
+        the bracket midpoint minus the radar clock; ``read_latency_ms`` (the
+        bracket width) bounds its uncertainty.
+
+        Some OPS firmware reports ``C?`` in whole seconds while rolling-buffer
+        captures report fractional ``trigger_time`` values. Whole-second reads
+        are not directly usable because their unknown fractional phase can be
+        almost one second off. When the clock is integer-only, this method keeps
+        sampling until it observes a one-second rollover and uses that boundary
+        to estimate the offset. If no precise sync is available, the summary is
+        marked unusable so the trigger path can fall back to first-byte timing.
+
+        Sound-triggered captures use this mapping to convert the radar's
+        internal ``trigger_time`` to host epoch only when
+        ``usable_for_trigger_timestamps`` is true. Returns a summary dict. By
+        default it is also stored on ``self.last_clock_sync``; pass
+        ``store=False`` for diagnostics that should not affect the live timing
+        path. Never raises on a missing/garbled reply.
+        """
+        if not self.serial or not self.serial.is_open:
+            raise ConnectionError("Not connected to radar")
+
+        reads: List[dict] = []
+
+        def read_once() -> None:
+            self.serial.reset_input_buffer()
+            host_before = time.time()
+            self.serial.write(b"C?")
+            buf = ""
+            deadline = time.monotonic() + per_read_timeout
+            while time.monotonic() < deadline:
+                waiting = self.serial.in_waiting
+                if waiting:
+                    buf += self.serial.read(waiting).decode("ascii", errors="ignore")
+                    if "}" in buf:  # full JSON reply received
+                        break
+                else:
+                    time.sleep(0.0005)
+            host_after = time.time()
+            host_mid = (host_before + host_after) / 2.0
+            radar_clock = _parse_ops_clock(buf)
+            reads.append(
+                {
+                    "host_before": host_before,
+                    "host_after": host_after,
+                    "host_mid": host_mid,
+                    "read_latency_ms": (host_after - host_before) * 1000.0,
+                    "radar_clock_s": radar_clock,
+                    "offset_s": None if radar_clock is None else host_mid - radar_clock,
+                    "raw": buf.strip(),
+                }
+            )
+
+        for idx in range(max(1, samples)):
+            if idx:
+                time.sleep(max(0.0, sample_interval_s))
+            read_once()
+
+        valid = [r for r in reads if r["radar_clock_s"] is not None]
+        has_fractional_clock = any(
+            abs(float(r["radar_clock_s"]) - round(float(r["radar_clock_s"]))) > 1e-6 for r in valid
+        )
+
+        def find_integer_rollover() -> Optional[tuple[dict, dict]]:
+            previous = None
+            for read in valid:
+                if previous is not None:
+                    prev_clock = float(previous["radar_clock_s"])
+                    current_clock = float(read["radar_clock_s"])
+                    if current_clock - prev_clock == 1.0:
+                        return previous, read
+                previous = read
+            return None
+
+        rollover = None if has_fractional_clock else find_integer_rollover()
+        sync_deadline = time.monotonic() + max(0.0, max_sync_duration_s)
+        while valid and not has_fractional_clock and rollover is None:
+            if time.monotonic() >= sync_deadline:
+                break
+            time.sleep(max(0.0, sample_interval_s))
+            read_once()
+            valid = [r for r in reads if r["radar_clock_s"] is not None]
+            rollover = find_integer_rollover()
+
+        best_raw = min(valid, key=lambda r: r["read_latency_ms"]) if valid else None
+        offsets = [r["offset_s"] for r in valid]
+        usable_for_trigger_timestamps = False
+        clock_sync_method = "no_valid_reads"
+        clock_resolution = None
+        best_offset_s = None
+        rollover_uncertainty_ms = None
+
+        if valid and has_fractional_clock:
+            usable_for_trigger_timestamps = True
+            clock_sync_method = "fractional_clock"
+            clock_resolution = "fractional"
+            best_offset_s = best_raw["offset_s"] if best_raw else None
+        elif valid:
+            clock_resolution = "integer"
+            if rollover is not None:
+                before_rollover, after_rollover = rollover
+                rollover_host_mid = (
+                    float(before_rollover["host_mid"]) + float(after_rollover["host_mid"])
+                ) / 2.0
+                best_offset_s = rollover_host_mid - float(after_rollover["radar_clock_s"])
+                rollover_uncertainty_ms = (
+                    float(after_rollover["host_mid"]) - float(before_rollover["host_mid"])
+                ) * 1000.0
+                usable_for_trigger_timestamps = True
+                clock_sync_method = "integer_rollover"
+            else:
+                clock_sync_method = "integer_unusable_no_rollover"
+
+        summary = {
+            "samples": len(reads),
+            "valid_samples": len(valid),
+            "best_offset_s": best_offset_s,
+            "raw_best_offset_s": best_raw["offset_s"] if best_raw else None,
+            "best_read_latency_ms": best_raw["read_latency_ms"] if best_raw else None,
+            "offset_spread_ms": (
+                (max(offsets) - min(offsets)) * 1000.0 if len(offsets) >= 2 else None
+            ),
+            "clock_resolution": clock_resolution,
+            "clock_sync_method": clock_sync_method,
+            "usable_for_trigger_timestamps": usable_for_trigger_timestamps,
+            "rollover_uncertainty_ms": rollover_uncertainty_ms,
+            "reads": reads,
+        }
+        if store:
+            self.last_clock_sync = summary
+        if usable_for_trigger_timestamps:
+            logger.info(
+                "[OPS] Clock sync: method=%s offset=%.3fs best_read_latency=%.1fms "
+                "spread=%sms rollover_uncertainty=%sms (%d/%d valid)",
+                clock_sync_method,
+                best_offset_s,
+                best_raw["read_latency_ms"],
+                "n/a"
+                if summary["offset_spread_ms"] is None
+                else f"{summary['offset_spread_ms']:.1f}",
+                "n/a" if rollover_uncertainty_ms is None else f"{rollover_uncertainty_ms:.1f}",
+                len(valid),
+                len(reads),
+            )
+        elif valid:
+            logger.warning(
+                "[OPS] Clock sync unusable for trigger timestamps: method=%s "
+                "resolution=%s spread=%sms (%d/%d valid); falling back to first-byte timing",
+                clock_sync_method,
+                clock_resolution,
+                "n/a"
+                if summary["offset_spread_ms"] is None
+                else f"{summary['offset_spread_ms']:.1f}",
+                len(valid),
+                len(reads),
+            )
+        else:
+            logger.warning("[OPS] Clock sync: no valid C? responses (%d attempts)", len(reads))
+        return summary
 
     def get_info(self) -> dict:
         """
@@ -267,9 +453,9 @@ class OPS243Radar:
         response = self._send_command("??")
         info = {}
 
-        for line in response.split('\n'):
+        for line in response.split("\n"):
             line = line.strip()
-            if line.startswith('{') and line.endswith('}'):
+            if line.startswith("{") and line.endswith("}"):
                 try:
                     data = json.loads(line)
                     info.update(data)
@@ -300,7 +486,7 @@ class OPS243Radar:
             SpeedUnit.MPH: "mph",
             SpeedUnit.KPH: "kph",
             SpeedUnit.FPS: "fps",
-            SpeedUnit.CMS: "cm/s"
+            SpeedUnit.CMS: "cm/s",
         }
         self._unit = unit_names[unit]
 
@@ -326,7 +512,7 @@ class OPS243Radar:
             10000: "SX",
             20000: "S2",
             50000: "SL",
-            100000: "SC"
+            100000: "SC",
         }
 
         if rate in rate_commands:
@@ -346,12 +532,7 @@ class OPS243Radar:
         Args:
             size: Buffer size (128, 256, 512, or 1024)
         """
-        size_commands = {
-            128: "S(",
-            256: "S[",
-            512: "S<",
-            1024: "S>"
-        }
+        size_commands = {128: "S(", 256: "S[", 512: "S<", 1024: "S>"}
         if size in size_commands:
             self._send_command(size_commands[size])
 
@@ -559,10 +740,10 @@ class OPS243Radar:
             print(f"[SERIAL] {line!r}")
 
         try:
-            if self._json_mode and line.startswith('{'):
+            if self._json_mode and line.startswith("{"):
                 data = json.loads(line)
-                speed_data = data.get('speed', 0)
-                magnitude_data = data.get('magnitude')
+                speed_data = data.get("speed", 0)
+                magnitude_data = data.get("magnitude")
 
                 # Handle array format from O4 multi-object mode
                 # Arrays are ordered by magnitude (strongest first)
@@ -573,7 +754,9 @@ class OPS243Radar:
                     magnitude = float(magnitude_data[0]) if magnitude_data else None
 
                     if _show_raw_readings:
-                        print(f"[MULTI] {len(speed_data)} objects: speeds={speed_data} mags={magnitude_data}")
+                        print(
+                            f"[MULTI] {len(speed_data)} objects: speeds={speed_data} mags={magnitude_data}"
+                        )
                 else:
                     speed = float(speed_data)
                     magnitude = float(magnitude_data) if magnitude_data else None
@@ -591,14 +774,20 @@ class OPS243Radar:
                     print(f"[RAW] {speed:+.1f} mph -> {direction.value} (mag: {magnitude})")
 
                 # Log parsed reading for debugging
-                logger.debug("[OPS] PARSED: raw_speed=%.2f abs_speed=%.2f dir=%s mag=%s", speed, abs(speed), direction.value, magnitude)
+                logger.debug(
+                    "[OPS] PARSED: raw_speed=%.2f abs_speed=%.2f dir=%s mag=%s",
+                    speed,
+                    abs(speed),
+                    direction.value,
+                    magnitude,
+                )
 
                 return SpeedReading(
                     speed=abs(speed),
                     direction=direction,
                     magnitude=magnitude,
                     timestamp=time.time(),
-                    unit=self._unit
+                    unit=self._unit,
                 )
 
             # Plain number format - direction from sign
@@ -612,31 +801,19 @@ class OPS243Radar:
             if _show_raw_readings:
                 print(f"[RAW] {speed:+.1f} mph -> {direction.value}")
 
-            logger.debug("[OPS] PARSED (plain): raw_speed=%.2f abs_speed=%.2f dir=%s", speed, abs(speed), direction.value)
+            logger.debug(
+                "[OPS] PARSED (plain): raw_speed=%.2f abs_speed=%.2f dir=%s",
+                speed,
+                abs(speed),
+                direction.value,
+            )
 
             return SpeedReading(
-                speed=abs(speed),
-                direction=direction,
-                timestamp=time.time(),
-                unit=self._unit
+                speed=abs(speed), direction=direction, timestamp=time.time(), unit=self._unit
             )
         except (ValueError, json.JSONDecodeError) as e:
             logger.warning("[OPS] Failed to parse reading: %r - %s", line, e)
             return None
-
-    def stop_streaming(self):
-        """Stop any active I/Q streaming."""
-        self._streaming = False
-        if self._stream_thread:
-            self._stream_thread.join(timeout=2.0)
-            self._stream_thread = None
-
-        # If we were doing I/Q streaming, tell radar to stop
-        if self._iq_callback is not None:
-            self.disable_raw_iq_output()
-
-        self._iq_callback = None
-        self._iq_error_callback = None
 
     def save_config(self):
         """Save current configuration to persistent memory."""
@@ -676,9 +853,12 @@ class OPS243Radar:
         if not self.serial or not self.serial.is_open:
             raise ConnectionError("Not connected to radar")
 
-        print(f"[RADAR] Entering rolling buffer mode (S#{pre_trigger_segments}, S={sample_rate_ksps})...")
-        logger.info("[OPS] Entering rolling buffer mode (pre_trigger_segments=%d)...",
-                    pre_trigger_segments)
+        print(
+            f"[RADAR] Entering rolling buffer mode (S#{pre_trigger_segments}, S={sample_rate_ksps})..."
+        )
+        logger.info(
+            "[OPS] Entering rolling buffer mode (pre_trigger_segments=%d)...", pre_trigger_segments
+        )
 
         # Clear any stale data
         self.serial.reset_input_buffer()
@@ -724,9 +904,14 @@ class OPS243Radar:
         # to ensure stable state before accepting triggers
         time.sleep(0.3)
 
-        print(f"[RADAR] Rolling buffer mode ACTIVE (S#{pre_trigger_segments}, {sample_rate_ksps}ksps)")
-        logger.info("[OPS] Rolling buffer mode active (S#%d, %dksps)",
-                    pre_trigger_segments, sample_rate_ksps)
+        print(
+            f"[RADAR] Rolling buffer mode ACTIVE (S#{pre_trigger_segments}, {sample_rate_ksps}ksps)"
+        )
+        logger.info(
+            "[OPS] Rolling buffer mode active (S#%d, %dksps)",
+            pre_trigger_segments,
+            sample_rate_ksps,
+        )
 
     def disable_rolling_buffer(self):
         """Disable rolling buffer mode and return to normal CW mode."""
@@ -735,8 +920,9 @@ class OPS243Radar:
         time.sleep(0.1)
         logger.info("[OPS] Rolling buffer mode disabled (returned to CW mode)")
 
-    def persist_rolling_buffer_mode(self, pre_trigger_segments: int = 16,
-                                     sample_rate_ksps: int = 30):
+    def persist_rolling_buffer_mode(
+        self, pre_trigger_segments: int = 16, sample_rate_ksps: int = 30
+    ):
         """
         Save rolling buffer mode to persistent memory.
 
@@ -765,16 +951,17 @@ class OPS243Radar:
 
         # Enter rolling buffer mode with desired settings
         self.enter_rolling_buffer_mode(
-            pre_trigger_segments=pre_trigger_segments,
-            sample_rate_ksps=sample_rate_ksps
+            pre_trigger_segments=pre_trigger_segments, sample_rate_ksps=sample_rate_ksps
         )
 
         # Save to persistent memory
         self.serial.write(b"A!")
         time.sleep(0.5)
 
-        logger.info("[OPS] Rolling buffer mode saved to persistent memory. "
-                     "Power cycle the board for changes to take effect.")
+        logger.info(
+            "[OPS] Rolling buffer mode saved to persistent memory. "
+            "Power cycle the board for changes to take effect."
+        )
         print("[RADAR] Settings saved to persistent memory.")
         print("[RADAR] Power cycle the board (unplug USB, wait 3s, replug).")
 
@@ -817,17 +1004,20 @@ class OPS243Radar:
         while (time.time() - start_time) < timeout:
             if self.serial.in_waiting:
                 chunk = self.serial.read(self.serial.in_waiting)
-                response_lines.append(chunk.decode('ascii', errors='ignore'))
+                response_lines.append(chunk.decode("ascii", errors="ignore"))
                 bytes_received += len(chunk)
                 last_data_time = time.time()
 
                 # Check if we have complete data (Q array ends the response)
-                full_response = ''.join(response_lines)
+                full_response = "".join(response_lines)
                 if '"Q"' in full_response:
                     # Look for closing bracket of Q array followed by newline or EOF
                     q_idx = full_response.rfind('"Q"')
                     remaining = full_response[q_idx:]
-                    if ']}' in remaining or (remaining.rstrip().endswith(']') and remaining.count('[') == remaining.count(']')):
+                    if "]}" in remaining or (
+                        remaining.rstrip().endswith("]")
+                        and remaining.count("[") == remaining.count("]")
+                    ):
                         break
 
                 time.sleep(0.01)  # Short sleep to accumulate data
@@ -835,25 +1025,33 @@ class OPS243Radar:
                 # No data available
                 # If we've received some data and haven't gotten more in 0.5s, consider done
                 if bytes_received > 100 and (time.time() - last_data_time) > 0.5:
-                    full_response = ''.join(response_lines)
+                    full_response = "".join(response_lines)
                     if '"Q"' in full_response:
                         break
                 time.sleep(0.02)
 
-        full_response = ''.join(response_lines)
+        full_response = "".join(response_lines)
 
         # Only log issues, not normal operation
         if not full_response:
-            logger.warning("[OPS] S! trigger returned empty response after %.1fs", time.time() - start_time)
+            logger.warning(
+                "[OPS] S! trigger returned empty response after %.1fs", time.time() - start_time
+            )
         else:
-            logger.info("[OPS] S! trigger: %d bytes in %.1fs", len(full_response), time.time() - start_time)
+            logger.info(
+                "[OPS] S! trigger: %d bytes in %.1fs", len(full_response), time.time() - start_time
+            )
             if len(full_response) < 1000:
                 # Short response usually means mode not configured correctly
-                logger.info("[OPS] S! response too short (%s bytes): %s", len(full_response), repr(full_response[:100]))
+                logger.info(
+                    "[OPS] S! response too short (%s bytes): %s",
+                    len(full_response),
+                    repr(full_response[:100]),
+                )
 
         return full_response
 
-    def wait_for_hardware_trigger(self, timeout: float = 30.0) -> str:
+    def wait_for_hardware_trigger(self, timeout: float = 30.0, dump_grace: float = 8.0) -> str:
         """
         Wait for hardware trigger to fire and read the buffer dump.
 
@@ -862,7 +1060,11 @@ class OPS243Radar:
         (HOST_INT). Used with SoundTrigger (SparkFun SEN-14262).
 
         Args:
-            timeout: Maximum time to wait for trigger data
+            timeout: Maximum time to wait for the trigger to fire
+            dump_grace: Extra time allowed for the dump to finish once the
+                first byte has arrived. The ~46KB rolling-buffer dump takes
+                ~4-5s; a trigger firing near the end of the timeout window
+                must not have its dump cut off by the original deadline.
 
         Returns:
             Raw response string containing JSON lines, or empty string on timeout
@@ -875,28 +1077,38 @@ class OPS243Radar:
 
         response_lines = []
         start_time = time.time()
+        deadline = start_time + timeout
         last_data_time = None
         bytes_received = 0
+        self.last_hardware_trigger_first_byte_timestamp = None
 
-        while (time.time() - start_time) < timeout:
+        while time.time() < deadline:
             if self.serial.in_waiting:
+                first_byte_timestamp = time.time() if last_data_time is None else None
                 chunk = self.serial.read(self.serial.in_waiting)
-                response_lines.append(chunk.decode('ascii', errors='ignore'))
+                response_lines.append(chunk.decode("ascii", errors="ignore"))
                 bytes_received += len(chunk)
-                if last_data_time is None:
-                    last_data_time = time.time()
-                    logger.debug("[OPS] Hardware trigger: first byte after %.1fs", last_data_time - start_time)
+                if first_byte_timestamp is not None:
+                    last_data_time = first_byte_timestamp
+                    self.last_hardware_trigger_first_byte_timestamp = last_data_time
+                    # The trigger fired — the dump is now in flight. Extend
+                    # the deadline so a late trigger gets its full dump.
+                    deadline = max(deadline, last_data_time + dump_grace)
+                    logger.debug(
+                        "[OPS] Hardware trigger: first byte after %.1fs",
+                        last_data_time - start_time,
+                    )
                 else:
                     last_data_time = time.time()
 
                 # Check if we have complete I/Q data
-                full_response = ''.join(response_lines)
+                full_response = "".join(response_lines)
                 if '"Q"' in full_response:
                     q_idx = full_response.rfind('"Q"')
                     remaining = full_response[q_idx:]
-                    if ']}' in remaining or (
-                        remaining.rstrip().endswith(']')
-                        and remaining.count('[') == remaining.count(']')
+                    if "]}" in remaining or (
+                        remaining.rstrip().endswith("]")
+                        and remaining.count("[") == remaining.count("]")
                     ):
                         break
 
@@ -904,17 +1116,21 @@ class OPS243Radar:
             else:
                 # If we've started receiving data, use shorter timeout
                 if last_data_time and (time.time() - last_data_time) > 0.5:
-                    full_response = ''.join(response_lines)
+                    full_response = "".join(response_lines)
                     if '"Q"' in full_response:
                         break
                 time.sleep(0.02)
 
-        full_response = ''.join(response_lines) if response_lines else ""
+        full_response = "".join(response_lines) if response_lines else ""
 
         if not full_response:
             logger.info("[OPS] Hardware trigger: no data received within %.0fs", timeout)
         else:
-            logger.info("[OPS] Hardware trigger: %d bytes in %.1fs", len(full_response), time.time() - start_time)
+            logger.info(
+                "[OPS] Hardware trigger: %d bytes in %.1fs",
+                len(full_response),
+                time.time() - start_time,
+            )
 
         return full_response
 
@@ -948,7 +1164,9 @@ class OPS243Radar:
             time.sleep(0.2)
             if self.serial.in_waiting == 0:
                 break
-        logger.info("[OPS] Re-arm drain: %d bytes in %.1fs", total_drained, time.time() - drain_start)
+        logger.info(
+            "[OPS] Re-arm drain: %d bytes in %.1fs", total_drained, time.time() - drain_start
+        )
 
         # Restart sampling
         self.serial.write(b"PA")
@@ -969,7 +1187,9 @@ class OPS243Radar:
         self.serial.reset_input_buffer()
         logger.info("[OPS] Rolling buffer re-armed (S#%d)", pre_trigger_segments)
 
-    def configure_for_rolling_buffer(self, pre_trigger_segments: int = 16, sample_rate_ksps: int = 30):
+    def configure_for_rolling_buffer(
+        self, pre_trigger_segments: int = 16, sample_rate_ksps: int = 30
+    ):
         """
         Configure radar optimally for rolling buffer mode.
 
@@ -1000,7 +1220,9 @@ class OPS243Radar:
         logger.info("[OPS] Transmit power: level 3 (reduced to avoid clipping)")
 
         # Enter rolling buffer mode using the single source of truth
-        self.enter_rolling_buffer_mode(pre_trigger_segments=pre_trigger_segments, sample_rate_ksps=sample_rate_ksps)
+        self.enter_rolling_buffer_mode(
+            pre_trigger_segments=pre_trigger_segments, sample_rate_ksps=sample_rate_ksps
+        )
 
         logger.info("[OPS] Rolling buffer mode configured")
 
@@ -1124,16 +1346,16 @@ class OPS243Radar:
         try:
             # Read available data
             raw_bytes = self.serial.read(self.serial.in_waiting)
-            line = raw_bytes.decode('ascii', errors='ignore').strip()
+            line = raw_bytes.decode("ascii", errors="ignore").strip()
 
             if not line:
                 return None
 
             # May have multiple lines - take the last complete one
-            lines = line.split('\n')
+            lines = line.split("\n")
             for candidate in reversed(lines):
                 candidate = candidate.strip()
-                if candidate.startswith('{'):
+                if candidate.startswith("{"):
                     reading = self._parse_reading(candidate)
                     if reading:
                         return reading

@@ -115,6 +115,9 @@ count_over_time({app="openflight", log_type="shot_detected"} [24h])
 
 # Spin detection rate (shots with spin > 0)
 count_over_time({app="openflight", log_type="shot_detected"} | json | spin_rpm > 0 [24h])
+
+# Processing failures during a session
+{app="openflight", log_type="error"}
 ```
 
 ## How It Works
@@ -131,6 +134,7 @@ OpenFlight writes JSONL files to `~/openflight_sessions/session_<timestamp>_<mod
 | `connection` | Device connected | `device`, `port`, `baud`, `firmware`, `radc_available`, `base_freq` |
 | `trigger_event` | Trigger accepted/rejected | `accepted`, `latency_ms`, `trigger_type` |
 | `rolling_buffer_capture` | Raw I/Q capture | `num_samples`, `sample_rate` |
+| `error` | Processing or hardware failure | `error` (message), `context` (`component`, `stage`, `exception_type`, `exception_message`, …) |
 
 ### Alloy Pipeline
 

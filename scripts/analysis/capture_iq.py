@@ -22,7 +22,6 @@ To analyze afterwards:
 import argparse
 import pickle
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -223,6 +222,11 @@ Examples:
                         f"  spin={result.spin.spin_rpm:.0f}rpm "
                         f"(snr={result.spin.snr:.1f}, {result.spin.quality})"
                     )
+                elif result.spin and result.spin.rejection_reason:
+                    spin_str = (
+                        f"  spin=none ({result.spin.rejection_reason}, "
+                        f"snr={result.spin.snr:.1f})"
+                    )
                 club_str = f"  club={result.club_speed_mph:.1f}mph" if result.club_speed_mph else ""
                 smash_str = f"  smash={result.smash_factor:.2f}" if result.smash_factor else ""
 
@@ -250,6 +254,18 @@ Examples:
                     capture_dict["spin_rpm"] = round(result.spin.spin_rpm)
                     capture_dict["spin_snr"] = round(result.spin.snr, 1)
                     capture_dict["spin_quality"] = result.spin.quality
+                    capture_dict["spin_modulation_depth"] = result.spin.modulation_depth
+                    capture_dict["spin_peak_freq_hz"] = result.spin.peak_freq_hz
+                    capture_dict["spin_candidate_rpm"] = (
+                        round(result.spin.peak_freq_hz * 60)
+                        if result.spin.peak_freq_hz is not None else None
+                    )
+                    capture_dict["spin_seam_cycles"] = result.spin.seam_cycles
+                    capture_dict["spin_at_lower_rail"] = result.spin.at_lower_rail
+                    capture_dict["spin_at_upper_rail"] = result.spin.at_upper_rail
+                    capture_dict["spin_rejection_reason"] = (
+                        result.spin.rejection_reason
+                    )
             captures.append(capture_dict)
 
             # Re-arm for next trigger

@@ -9,7 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts" / "analysis"))
 
 import review_kld7_session
-from kld7_session_review_lib import analyze_session, load_session
+from kld7_session_review_lib import _validate_frames, analyze_session, load_session
 from review_kld7_session import ensure_output_dir
 
 SESSION_PATH = Path(__file__).parent.parent / "session_logs" / "session_20260403_133805_range.jsonl"
@@ -162,6 +162,20 @@ def test_analyze_session_rejects_non_numeric_frame_timestamp(tmp_path):
 
     with pytest.raises(ValueError, match="shot 1 frame 0 has non-numeric timestamp"):
         analyze_session(session_path)
+
+
+def test_validate_frames_decodes_experimental_radc_payloads():
+    """Experimental JSONL logs should preserve RADC bytes for future replay."""
+    frames = _validate_frames(
+        1,
+        {
+            "frames": [
+                {"timestamp": 1.0, "pdat": [], "radc_b64": "AQID"},
+            ]
+        },
+    )
+
+    assert frames[0]["radc"] == b"\x01\x02\x03"
 
 
 def test_ensure_output_dir_requires_safe_clean_target(tmp_path):

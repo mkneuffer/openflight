@@ -9,11 +9,6 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -22,6 +17,17 @@ from kld7_session_review_lib import ShotReview, analyze_session  # noqa: E402
 
 PROFILE_GRID_MS = np.arange(0.0, 261.0, 10.0)
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_pyplot():
+    """Import matplotlib only when plot export is requested."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+
+    import matplotlib.pyplot as plt
+
+    return plt
 
 
 def session_output_dir(session_path: Path) -> Path:
@@ -62,6 +68,7 @@ def ensure_output_dir(path: Path, *, clean: bool) -> None:
 
 def plot_shot_profile(result: ShotReview, session_name: str, output_path: Path) -> None:
     """Plot one reviewed shot path against all post-impact detections."""
+    plt = _load_pyplot()
     path = result.anchor.path
     times = np.array([d.time_ms for d in path], dtype=float)
     distances = np.array([d.distance_m for d in path], dtype=float)
@@ -218,6 +225,7 @@ def aggregate_band(
 
 def plot_overlay(results: list[ShotReview], session_name: str, output_path: Path) -> None:
     """Plot all selected shot profiles on one overlay."""
+    plt = _load_pyplot()
     fig, axis = plt.subplots(figsize=(12, 7))
     quality_colors = {"strong": "tab:blue", "partial": "tab:orange", "weak": "tab:red"}
 
@@ -283,6 +291,7 @@ def plot_overlay(results: list[ShotReview], session_name: str, output_path: Path
 
 def plot_launch_angle_review(results: list[ShotReview], output_path: Path) -> None:
     """Compare logged launch angles against extracted path angles."""
+    plt = _load_pyplot()
     shots = np.array([result.shot_number for result in results], dtype=float)
     logged = np.array(
         [

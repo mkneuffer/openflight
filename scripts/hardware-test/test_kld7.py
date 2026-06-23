@@ -23,7 +23,7 @@ A golf ball transits the 5m detection zone in ~30ms, so expect only
 (tracked target) since the tracking filter may not lock on in time.
 
 Prerequisites:
-    pip install kld7 pyserial
+    uv pip install -e '.[ui]'   # kld7 ships as a base dependency
 
 Usage:
     # Basic capture (auto-detect port, Ctrl+C to stop)
@@ -56,7 +56,7 @@ from pathlib import Path
 try:
     from kld7 import KLD7, FrameCode, KLD7Exception
 except ImportError:
-    print("Error: kld7 package not installed. Run: pip install kld7")
+    print("Error: kld7 package not installed. Reinstall the project: uv pip install -e '.[ui]'")
     sys.exit(1)
 
 from serial.tools.list_ports import comports

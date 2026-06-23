@@ -12,27 +12,36 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 
 # Re-export core processing functions
 from openflight.kld7.radc import (  # noqa: F401, E402
     ANTENNA_SPACING_M,
-    CFARDetection,
     DC_MASK_BINS,
     RADC_PAYLOAD_BYTES,
     SAMPLES_PER_CHANNEL,
     WAVELENGTH_M,
+    CFARDetection,
+    RADCChannelStats,
+    RADCFrameDiagnostics,
+    _velocity_to_bin,
+    aliased_velocity_from_ball_speed_mph,
     ball_bin_range_from_speed,
     bin_to_velocity_kmh,
     cfar_detect,
+    circular_bin_distance,
     compute_fft_complex,
     compute_spectrum,
+    default_ball_bin_ranges,
+    expected_ball_bin_from_speed,
     extract_launch_angle,
     find_impact_frames,
     parse_radc_payload,
     per_bin_angle_deg,
+    radc_capture_diagnostics,
+    radc_frame_diagnostics,
+    summarize_radc_diagnostics,
     to_complex_iq,
-    _velocity_to_bin,
 )
 
 # Keep local: offline-only constants, types, and functions below

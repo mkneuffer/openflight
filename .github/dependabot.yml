@@ -17,6 +17,16 @@ updates:
       - dependencies
       - javascript
     open-pull-requests-limit: 5
+    groups:
+      # react and react-dom share internal runtime state and must always be
+      # on the exact same version. Group them (with their type stubs) so a
+      # bump to one never lands without the other.
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
 
   - package-ecosystem: github-actions
     directory: /
